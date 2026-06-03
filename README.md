@@ -1,5 +1,7 @@
 # difftastic-status
 
+[![CI](https://github.com/rschmukler/difftastic-status/actions/workflows/ci.yml/badge.svg)](https://github.com/rschmukler/difftastic-status/actions/workflows/ci.yml)
+
 Render unstaged/staged changes in the `magit-status` buffer using
 [difftastic](https://github.com/Wilfred/difftastic), while keeping them as
 collapsible, navigable Magit sections with full staging support.
