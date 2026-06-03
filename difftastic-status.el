@@ -201,23 +201,37 @@ appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
 ;; of them stages that whole git hunk (the same boundary-snapping that Magit's
 ;; own hunk staging has).
 
-(defun difftastic-status--enclosing-file ()
-  "Return the value (filename) of the `file' section enclosing point, if any."
+(defun difftastic-status--enclosing-file-section ()
+  "Return the `file' section enclosing point, if any."
   (let ((s (magit-current-section)))
     (while (and s (not (eq (oref s type) 'file)))
       (setq s (oref s parent)))
-    (and s (oref s value))))
+    s))
+
+(defun difftastic-status--enclosing-file ()
+  "Return the value (filename) of the `file' section enclosing point, if any."
+  (when-let* ((s (difftastic-status--enclosing-file-section)))
+    (oref s value)))
+
+(defun difftastic-status--first-chunk (file-section)
+  "Return the first `difftastic-hunk' child of FILE-SECTION, or nil."
+  (and file-section
+       (seq-find (lambda (c) (eq (oref c type) 'difftastic-hunk))
+                 (oref file-section children))))
 
 (defun difftastic-status-visit-file-dwim ()
   "Visit the file enclosing point, jumping to the chunk's exact change.
 When on a chunk, jump to the line and column of its first new-side change
 \(via `difft --display json'); falls back to the chunk's stored gutter line.
-We avoid `magit-diff-visit-file' here because it expects the current section
-to be a real Magit diff/hunk section (with slots like `from-range'), which our
-custom `difftastic-hunk' sections do not have."
+On a file heading (not a chunk), behaves as if point were on the file's first
+chunk.  We avoid `magit-diff-visit-file' here because it expects the current
+section to be a real Magit diff/hunk section (with slots like `from-range'),
+which our custom `difftastic-hunk' sections do not have."
   (interactive)
-  (if-let* ((file (difftastic-status--enclosing-file)))
-      (let* ((chunk (difftastic-status--current-chunk))
+  (if-let* ((file-section (difftastic-status--enclosing-file-section)))
+      (let* ((file (oref file-section value))
+             (chunk (or (difftastic-status--current-chunk)
+                        (difftastic-status--first-chunk file-section)))
              (val (and chunk (oref chunk value)))
              (line (or (and val (ignore-errors
                                   (difftastic-status--chunk-visit-line
@@ -608,8 +622,13 @@ worktree to apply a patch to."
     (apply orig args)))
 
 (defun difftastic-status--visit-advice (orig &rest args)
-  "Around-advice for `magit-visit-thing' (see commentary)."
-  (if (difftastic-status--current-chunk)
+  "Around-advice for `magit-visit-thing' (see commentary).
+Handle both a difftastic chunk and a difftastic `file' section (one with
+`difftastic-hunk' children): visiting a real `magit-visit-thing' on the latter
+expects hunk slots our sections lack and would signal an `invalid slot' error."
+  (if (or (difftastic-status--current-chunk)
+          (difftastic-status--first-chunk
+           (difftastic-status--enclosing-file-section)))
       (difftastic-status-visit-file-dwim)
     (apply orig args)))
 
