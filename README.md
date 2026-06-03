@@ -206,9 +206,24 @@ the magit commands, which is binding- and evil-state-agnostic.
   shown there. Merge commits (shown as a combined diff) and `--no-index` diffs
   are left to Magit's stock rendering.
 
+## Testing
+
+The test suite ([`test/difftastic-status-test.el`](./test/difftastic-status-test.el))
+uses ERT and is run with [Eldev][eldev]:
+
+```sh
+eldev test
+```
+
+It mixes fast unit tests for the pure helpers with integration tests that drive
+the real rendering and staging pipeline against a throwaway git repository. The
+integration tests need `difft` and `git` on `PATH` and are skipped
+automatically when either is missing.
+
 ## License
 
 [MIT](./LICENSE).
 
 [difftastic-el]: https://github.com/pkryger/difftastic.el
 [evil]: https://github.com/emacs-evil/evil
+[eldev]: https://github.com/emacs-eldev/eldev

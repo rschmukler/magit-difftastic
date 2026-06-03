@@ -1,0 +1,14 @@
+; -*- mode: emacs-lisp; lexical-binding: t -*-
+
+;; Eldev configuration for difftastic-status.
+;;
+;; Dependencies (magit, difftastic and their transitive deps) are declared via
+;; the `Package-Requires' header in difftastic-status.el; Eldev resolves them
+;; from the archives selected below.
+;;
+;;   eldev test     ;; run the ERT suite (test/difftastic-status-test.el)
+;;   eldev compile  ;; byte-compile
+
+(eldev-use-package-archive 'gnu-elpa)
+(eldev-use-package-archive 'nongnu-elpa)
+(eldev-use-package-archive 'melpa)
