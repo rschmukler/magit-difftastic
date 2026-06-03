@@ -50,6 +50,12 @@ Unstaged changes (2)
   revisions (a range diff, or a commit being viewed) are rendered display-only.
   Anything difftastic can't render (`--no-index` diffs, merge commits shown as a
   combined diff) falls straight back to Magit's stock rendering.
+- **Per-file rendering toggle** — with point on a file (or chunk),
+  `difftastic-status-toggle-file-rendering` (`C-c C-d` by default) switches just
+  that file between difftastic and stock Magit rendering, and back. A
+  stock-rendered file uses Magit's own per-hunk / per-line staging — handy for
+  fine-grained staging or a file difftastic renders awkwardly. The choice is
+  buffer-local and survives refreshes.
 - **Toggleable** — `difftastic-status-mode` is a global minor mode. Turn it off
   and Magit's stock unstaged/staged sections come right back, so you always
   have a fallback. The diff- and revision-buffer integrations can be scoped
@@ -157,6 +163,7 @@ step is skipped entirely — no hard dependency, nothing assumed.
 | `difftastic-status-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
 | `difftastic-status-diff-buffers`         | `t`          | Render `magit-diff-mode` buffers (including the commit-message preview) with difftastic chunks. |
 | `difftastic-status-revision-buffers`     | `t`          | Render `magit-revision-mode` buffers (viewing a commit) with difftastic chunks. |
+| `difftastic-status-toggle-rendering-key` | `"C-c C-d"`  | Key bound on difftastic/stock sections to `difftastic-status-toggle-file-rendering` (switch the file at point between difftastic and stock Magit rendering). `nil` binds no key. |
 
 ## How it works
 
