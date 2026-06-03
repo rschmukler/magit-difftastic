@@ -74,7 +74,7 @@
 ;; sub-sections, with both FILE-LEVEL and PER-CHUNK staging.
 ;;
 ;;   Each changed file becomes a Magit `file' section.  Its body is the
-;;   difftastic-rendered (inline display) diff, which we split on difftastic's
+;;   difftastic-rendered diff, which we split on difftastic's
 ;;   own `FILE --- N/M --- LANG' chunk headers: those headers are dropped and
 ;;   each chunk becomes its own collapsible `difftastic-hunk' sub-section with a
 ;;   minimal, native-looking `@@ line N @@' heading.
@@ -137,12 +137,24 @@
   :prefix "difftastic-status-")
 
 (defcustom difftastic-status-display "inline"
-  "Value passed to difft's `--display'.
-`inline' is strongly recommended: a single-column layout maps one screen
-row to one logical diff line, which is what later steps need for
-line-range staging.  `side-by-side' renders too, but its two-column
-layout makes per-line mapping ambiguous."
-  :type 'string
+  "Difft layout used to render chunks (passed to difft's `--display').
+All three layouts support per-chunk and line-range (region) staging:
+
+  - `inline'                 single column, closest to a classic diff.
+  - `side-by-side'           two columns; a chunk that is purely additions
+                             or removals collapses back to one column.
+  - `side-by-side-show-both' two columns always, so every row is uniform."
+  :type '(choice (const :tag "Inline (single column)" "inline")
+                 (const :tag "Side by side" "side-by-side")
+                 (const :tag "Side by side, always two columns"
+                        "side-by-side-show-both"))
+  :group 'difftastic-status)
+
+(defcustom difftastic-status-line-numbers t
+  "Whether difft's per-line number gutters are shown in rendered chunks.
+When nil, the line-number columns are hidden in the status, diff and revision
+buffers.  Staging works the same either way."
+  :type 'boolean
   :group 'difftastic-status)
 
 (defcustom difftastic-status-chunk-heading-face 'magit-diff-hunk-heading
@@ -155,9 +167,30 @@ for understated headings, `magit-section-heading' for a bolder look, or
   :type 'face
   :group 'difftastic-status)
 
+(defcustom difftastic-status-width 'window
+  "Column width passed to difft, controlling where it wraps long lines.
+
+  - `window' (default): fit the current window's width.
+  - an integer: use exactly that many columns; a larger value wraps less,
+    a smaller value wraps more.
+
+At least `difftastic-status-min-width' columns are always used.  The
+`side-by-side' layouts split this width across two columns."
+  :type '(choice (const :tag "Fit window width" window)
+                 (integer :tag "Fixed number of columns"))
+  :group 'difftastic-status)
+
+(defcustom difftastic-status-min-width 40
+  "Minimum column width requested from difft (see `difftastic-status-width')."
+  :type 'integer
+  :group 'difftastic-status)
+
 (defun difftastic-status--width ()
-  "Width (in columns) to request from difft for the status buffer."
-  (max 40 (- (window-body-width (get-buffer-window (current-buffer) t)) 2)))
+  "Width in columns to request from difft for the current buffer."
+  (max difftastic-status-min-width
+       (if (integerp difftastic-status-width)
+           difftastic-status-width
+         (- (window-body-width (get-buffer-window (current-buffer) t)) 2))))
 
 (defconst difftastic-status--diff-base '("--no-pager" "diff" "--ext-diff")
   "Leading git invocation for difftastic `git diff' rendering.
@@ -181,7 +214,8 @@ appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
          (raw (with-temp-buffer
                 ;; `difftastic--build-git-process-environment' sets
                 ;; GIT_EXTERNAL_DIFF=difft ... so plain `git diff --ext-diff'
-                ;; routes through difftastic.  We append `--display inline'.
+                ;; routes through difftastic.  We append `--display' per
+                ;; `difftastic-status-display'.
                 (let ((process-environment
                        (difftastic--build-git-process-environment
                         width (list "--display" difftastic-status-display))))
@@ -439,19 +473,27 @@ difftastic chunk maps onto."
 ;;; Region (line-range) staging
 ;;
 ;; When a region is active within a chunk, operate on just the selected lines.
-;; We classify each selected difft display line as old- or new-side -- old-side
-;; rows begin with a digit (the old line number); new-side rows begin with
-;; whitespace then the new line number -- to collect the selected old/new file
-;; line numbers.  Then we transform git's OWN diff hunks the same way
+;; For each selected screen row we need its old- and new-side file line numbers.
+;; We get them by reusing difftastic's own parser (`difftastic--classify-chunk'
+;; + `difftastic--parse-{side-by-side,single-column}-chunk'), which yields, per
+;; row, the left (old) and right (new) line numbers regardless of layout and
+;; carries numbers across wrapped (`.') rows.  Non-nil left numbers go into the
+;; selected OLD set, non-nil right numbers into the selected NEW set; collecting
+;; an unchanged context row's numbers is harmless because the patch builder only
+;; keeps git `-'/`+' lines whose numbers are actually selected.
+;;
+;; We then transform git's own diff hunks the same way
 ;; `magit-diff-hunk-region-patch' does: keep context and selected +/- lines,
 ;; turn unselected lines whose marker matches OP into context, drop the rest.
 ;; `diff-fixup-modifs' recomputes the @@ counts and
 ;; `magit-apply--adjust-hunk-new-starts' fixes the new-starts.
+;;
+;; `difftastic-status--line-side+num' is a legacy inline-only fallback for
+;; difftastic versions that don't expose the parser.
 
 (defun difftastic-status--line-side+num (line)
   "Classify difft inline display LINE; return (SIDE . NUM) or nil.
-SIDE is `old' (row begins with a digit) or `new' (row begins with
-whitespace then the new line number).  NUM is the 1-based file line."
+SIDE is `old' or `new'; NUM is the 1-based file line."
   (cond
    ((string-match "\\`\\([0-9]+\\)" line)
     (cons 'old (string-to-number (match-string 1 line))))
@@ -464,25 +506,74 @@ whitespace then the new line number).  NUM is the 1-based file line."
        (< (region-beginning) (oref section end))
        (> (region-end) (or (oref section content) (oref section start)))))
 
+(defun difftastic-status--parse-chunk-bounds (beg end)
+  "Return difftastic's per-line parse for the chunk between BEG and END, or nil.
+Each element is (BEG-END LEFT RIGHT): BEG-END is (BOL EOL); LEFT and RIGHT are
+each (LINE-NUM BEG END) or nil.  Returns nil when difftastic's parser is
+unavailable, so callers can fall back."
+  ;; difftastic's parsers skip the first line of the bounds (in difft's own
+  ;; output that is the `FILE --- N/M --- LANG' header; here it is our heading),
+  ;; so BEG must be the chunk heading line's start.
+  (when (and (fboundp 'difftastic--classify-chunk)
+             (fboundp 'difftastic--parse-side-by-side-chunk)
+             (fboundp 'difftastic--parse-single-column-chunk))
+    (let ((bounds (cons beg end)))
+      (ignore-errors
+        (pcase (difftastic--classify-chunk bounds)
+          ('side-by-side  (difftastic--parse-side-by-side-chunk bounds))
+          ('single-column (difftastic--parse-single-column-chunk bounds)))))))
+
+(defun difftastic-status--parse-chunk-lines (section)
+  "Return difftastic's per-line parse of chunk SECTION, or nil.
+See `difftastic-status--parse-chunk-bounds'."
+  (difftastic-status--parse-chunk-bounds (oref section start) (oref section end)))
+
+(defun difftastic-status--hide-line-numbers (beg end)
+  "Visually blank difft's line-number gutters in the chunk between BEG and END.
+The underlying buffer text is left intact, so staging is unaffected.  No-op
+when difftastic's parser is unavailable."
+  ;; Cover each line-number span with an equal-width run of spaces via a
+  ;; `display' property, so columns stay aligned while the numbers disappear.
+  (dolist (line (difftastic-status--parse-chunk-bounds beg end))
+    (pcase-let ((`(,_ ,left ,right) line))
+      (dolist (cell (list left right))
+        (pcase cell
+          (`(,_ ,nbeg ,nend)
+           (when (and (integerp nbeg) (integerp nend) (< nbeg nend))
+             (put-text-property nbeg nend 'display
+                                (make-string (- nend nbeg) ?\s)))))))))
+
 (defun difftastic-status--region-selected-lines (section)
   "Return (OLD-LINES . NEW-LINES) selected by the active region within SECTION.
 The region is clamped to SECTION's body and snapped to whole lines."
+  ;; Read line numbers via difftastic's parser (correct for inline and either
+  ;; side-by-side layout, including wrapped rows): each row overlapping the
+  ;; region contributes its non-nil left number to OLD and right to NEW.  Fall
+  ;; back to the inline-only heuristic when the parser is unavailable.
   (let ((beg (max (region-beginning)
                   (or (oref section content) (oref section start))))
         (end (min (region-end) (oref section end)))
         (old nil) (new nil))
     (when (< beg end)
-      (save-excursion
-        (goto-char beg)
-        (beginning-of-line)
-        (while (< (point) end)
-          (when-let* ((sn (difftastic-status--line-side+num
-                           (buffer-substring-no-properties
-                            (line-beginning-position) (line-end-position)))))
-            (pcase (car sn)
-              ('old (push (cdr sn) old))
-              ('new (push (cdr sn) new))))
-          (forward-line))))
+      (if-let* ((lines (difftastic-status--parse-chunk-lines section)))
+          (dolist (l lines)
+            (pcase-let ((`((,bol ,eol) ,left ,right) l))
+              ;; Include a row when it overlaps the (whole-line) region.
+              (when (and (< bol end) (> eol beg))
+                (when (car left)  (push (car left) old))
+                (when (car right) (push (car right) new)))))
+        ;; Legacy fallback (inline only).
+        (save-excursion
+          (goto-char beg)
+          (beginning-of-line)
+          (while (< (point) end)
+            (when-let* ((sn (difftastic-status--line-side+num
+                             (buffer-substring-no-properties
+                              (line-beginning-position) (line-end-position)))))
+              (pcase (car sn)
+                ('old (push (cdr sn) old))
+                ('new (push (cdr sn) new))))
+            (forward-line)))))
     (cons (nreverse old) (nreverse new))))
 
 (defun difftastic-status--split-hunks (text)
@@ -744,14 +835,20 @@ can rebuild the corresponding git hunk."
         ;; `:keymap' would signal `invalid-slot-name'.  It is applied later in
         ;; `magit-insert-section--finish', after this body runs.
         (oset section keymap 'difftastic-status-hunk-section-map)
-        (magit-insert-heading
-          ;; Include the newline in the faced string (as Magit does for its own
-          ;; hunk headings) so a face with `:extend t' -- e.g. the default
-          ;; `magit-diff-hunk-heading' -- fills the heading bar to the window edge.
-          (propertize (concat heading "\n")
-                      'font-lock-face difftastic-status-chunk-heading-face))
-        (dolist (l body-lines)
-          (insert l "\n"))))))
+        ;; Remember where the heading begins: difftastic's line-number parser
+        ;; (used to hide the gutters) treats the first line of its bounds as the
+        ;; chunk header, which is exactly this heading.
+        (let ((heading-start (point)))
+          (magit-insert-heading
+            ;; Include the newline in the faced string (as Magit does for its own
+            ;; hunk headings) so a face with `:extend t' -- e.g. the default
+            ;; `magit-diff-hunk-heading' -- fills the heading bar to the window edge.
+            (propertize (concat heading "\n")
+                        'font-lock-face difftastic-status-chunk-heading-face))
+          (dolist (l body-lines)
+            (insert l "\n"))
+          (unless difftastic-status-line-numbers
+            (difftastic-status--hide-line-numbers heading-start (point))))))))
 
 (defun difftastic-status--insert-chunks (rendered file context)
   "Split RENDERED difftastic output for FILE into collapsible per-chunk sections.

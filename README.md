@@ -158,7 +158,10 @@ step is skipped entirely — no hard dependency, nothing assumed.
 
 | Variable                                 | Default      | Description                                                                 |
 |------------------------------------------|--------------|-----------------------------------------------------------------------------|
-| `difftastic-status-display`              | `"inline"`   | Value passed to `difft --display`. `inline` is strongly recommended; line-range staging relies on its one-row-per-line layout. |
+| `difftastic-status-display`              | `"inline"`   | Layout passed to `difft --display`: `"inline"`, `"side-by-side"`, or `"side-by-side-show-both"`. All support per-chunk and line-range staging. |
+| `difftastic-status-line-numbers`         | `t`          | Whether difft's per-line number gutters are shown. When `nil` they are hidden; staging works the same either way. |
+| `difftastic-status-width`                | `window`     | Column width passed to difft, controlling where it wraps long lines: `window` (fit the window) or an integer (fixed columns; larger wraps less). |
+| `difftastic-status-min-width`            | `40`         | Minimum column width requested from difft. |
 | `difftastic-status-chunk-heading-face`   | `magit-diff-hunk-heading` | Face for the per-chunk `@@ line N @@` headings. Defaults to Magit's hunk-heading face (a full-width bar); set to e.g. `magit-hash` for understated headings. |
 | `difftastic-status-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
 | `difftastic-status-diff-buffers`         | `t`          | Render `magit-diff-mode` buffers (including the commit-message preview) with difftastic chunks. |
