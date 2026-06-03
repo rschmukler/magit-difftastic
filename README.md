@@ -36,6 +36,11 @@ Unstaged changes (2)
 - **Difftastic rendering inside `magit-status`** — unstaged and staged
   sections are replaced with difftastic output, using difftastic's own colour
   vectors so it matches `difftastic-magit-diff`.
+- **Inline or side-by-side**, with optional Emacs major-mode **syntax
+  highlighting** layered on top (difft only emphasizes keywords/comments) and
+  optional hiding of the line-number gutters — see
+  `difftastic-status-display`, `difftastic-status-syntax-highlight` and
+  `difftastic-status-line-numbers`.
 - **Collapsible, navigable sections** — files and chunks are real Magit
   sections, so `TAB`, section motion, etc. all work.
 - **Multi-level staging** that maps difftastic's display back onto real git
@@ -162,6 +167,7 @@ step is skipped entirely — no hard dependency, nothing assumed.
 |------------------------------------------|--------------|-----------------------------------------------------------------------------|
 | `difftastic-status-display`              | `"side-by-side"` | Layout passed to `difft --display`: `"inline"`, `"side-by-side"`, or `"side-by-side-show-both"`. All support per-chunk and line-range staging. |
 | `difftastic-status-line-numbers`         | `t`          | Whether difft's per-line number gutters are shown. When `nil` they are hidden; staging works the same either way. |
+| `difftastic-status-syntax-highlight`     | `t`          | Layer the file's Emacs major-mode font-lock faces onto each chunk's code (difft only emphasizes keywords/comments). Diff colors keep precedence. Adds per-file fontification cost; set `nil` to disable. |
 | `difftastic-status-width`                | `window`     | Column width passed to difft, controlling where it wraps long lines: `window` (fit the window) or an integer (fixed columns; larger wraps less). |
 | `difftastic-status-min-width`            | `40`         | Minimum column width requested from difft. |
 | `difftastic-status-chunk-heading-face`   | `magit-diff-hunk-heading` | Face for the per-chunk `@@ line N @@` headings. Defaults to Magit's hunk-heading face (a full-width bar); set to e.g. `magit-hash` for understated headings. |

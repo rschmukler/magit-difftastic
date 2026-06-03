@@ -136,7 +136,7 @@
   :group 'magit
   :prefix "difftastic-status-")
 
-(defcustom difftastic-status-display "side-by-side"
+(defcustom difftastic-status-display "side-by-side-show-both"
   "Difft layout used to render chunks (passed to difft's `--display').
 All three layouts support per-chunk and line-range (region) staging:
 
@@ -154,6 +154,19 @@ All three layouts support per-chunk and line-range (region) staging:
   "Whether difft's per-line number gutters are shown in rendered chunks.
 When nil, the line-number columns are hidden in the status, diff and revision
 buffers.  Staging works the same either way."
+  :type 'boolean
+  :group 'difftastic-status)
+
+(defcustom difftastic-status-syntax-highlight t
+  "Whether to add major-mode syntax highlighting to rendered chunks.
+difft only emphasizes keywords and comments (bold/italic) and colours the
+changed tokens; when this is non-nil each chunk's code is additionally
+fontified with the file's Emacs major mode, so keywords, strings, types, etc.
+get their usual faces.  The diff colours difft applies to changed tokens keep
+precedence.
+
+This re-fontifies each rendered file with its major mode, which adds some cost
+on top of difft itself; set to nil to turn it off."
   :type 'boolean
   :group 'difftastic-status)
 
@@ -506,6 +519,20 @@ SIDE is `old' or `new'; NUM is the 1-based file line."
        (< (region-beginning) (oref section end))
        (> (region-end) (or (oref section content) (oref section start)))))
 
+(defun difftastic-status--chunk-layout (beg end)
+  "Return the layout of the chunk BEG..END: `single-column' or `side-by-side'.
+Driven by `difftastic-status-display', which we control and is therefore
+reliable: `inline' is always single column and `side-by-side-show-both' always
+two.  Only the plain `side-by-side' mode -- where difft may collapse a chunk
+that is purely additions or removals to a single column -- consults difftastic's
+own (heuristic) classifier."
+  (cond
+   ((equal difftastic-status-display "inline") 'single-column)
+   ((equal difftastic-status-display "side-by-side-show-both") 'side-by-side)
+   ((and (fboundp 'difftastic--classify-chunk)
+         (ignore-errors (difftastic--classify-chunk (cons beg end)))))
+   (t 'side-by-side)))
+
 (defun difftastic-status--parse-chunk-bounds (beg end)
   "Return difftastic's per-line parse for the chunk between BEG and END, or nil.
 Each element is (BEG-END LEFT RIGHT): BEG-END is (BOL EOL); LEFT and RIGHT are
@@ -514,12 +541,11 @@ unavailable, so callers can fall back."
   ;; difftastic's parsers skip the first line of the bounds (in difft's own
   ;; output that is the `FILE --- N/M --- LANG' header; here it is our heading),
   ;; so BEG must be the chunk heading line's start.
-  (when (and (fboundp 'difftastic--classify-chunk)
-             (fboundp 'difftastic--parse-side-by-side-chunk)
+  (when (and (fboundp 'difftastic--parse-side-by-side-chunk)
              (fboundp 'difftastic--parse-single-column-chunk))
     (let ((bounds (cons beg end)))
       (ignore-errors
-        (pcase (difftastic--classify-chunk bounds)
+        (pcase (difftastic-status--chunk-layout beg end)
           ('side-by-side  (difftastic--parse-side-by-side-chunk bounds))
           ('single-column (difftastic--parse-single-column-chunk bounds)))))))
 
@@ -542,6 +568,319 @@ when difftastic's parser is unavailable."
            (when (and (integerp nbeg) (integerp nend) (< nbeg nend))
              (put-text-property nbeg nend 'display
                                 (make-string (- nend nbeg) ?\s)))))))))
+
+;;; Syntax highlighting
+;;
+;; difft only emphasizes keywords/comments (bold/italic) and colours changed
+;; tokens; it does not colour by token type.  To add real syntax highlighting we
+;; layer the file's Emacs major-mode font-lock faces onto each chunk's code.
+;;
+;; We do not need the original blobs from git.  difft renders the actual code
+;; text for every shown row (changed and context), so per chunk we:
+;;
+;;   1. find each row's code span(s) and source line number(s) per side, using
+;;      difftastic's own parser/classifier (so inline and both side-by-side
+;;      layouts, including wrapped rows, are handled uniformly);
+;;   2. reconstruct each side's source text from those very spans (joining
+;;      wrapped rows back into one line) and fontify it with the major mode;
+;;   3. copy the resulting face runs back onto the rendered spans, APPENDED so
+;;      difft's diff colours keep precedence over the syntax colour.
+;;
+;; Because the reconstructed text is built from the same spans we paint, the
+;; mapping is exact -- no fuzzy column alignment is needed.
+
+(defun difftastic-status--mode-for-file (file)
+  "Return the major-mode function Emacs would use for FILE, or nil.
+Only a callable mode symbol is returned; `fundamental-mode' and non-symbol
+entries yield nil (nothing to highlight)."
+  (let ((mode (let ((case-fold-search (memq system-type
+                                            '(windows-nt cygwin darwin))))
+                (assoc-default file auto-mode-alist #'string-match))))
+    (when (consp mode) (setq mode (car mode)))
+    (and mode (symbolp mode) (fboundp mode)
+         (not (eq mode 'fundamental-mode))
+         mode)))
+
+(defvar difftastic-status--single-column-gutter-re nil
+  "Cached regexp matching difft's two-column inline gutter (or nil).")
+
+(defun difftastic-status--single-column-gutter-re ()
+  "Return a regexp matching difft's inline (single-column) gutter, or nil.
+Built from difftastic's own line-number rx so the code column starts exactly
+where difft puts it; nil when difftastic does not expose that rx."
+  (or difftastic-status--single-column-gutter-re
+      (and (fboundp 'difftastic--line-num-or-spaces-rx)
+           (boundp 'difftastic--line-num-digits)
+           (setq difftastic-status--single-column-gutter-re
+                 (ignore-errors
+                   (rx-to-string
+                    `(seq bol
+                          ,(difftastic--line-num-or-spaces-rx
+                            difftastic--line-num-digits)
+                          ,(difftastic--line-num-or-spaces-rx
+                            difftastic--line-num-digits))
+                    t))))))
+
+(defun difftastic-status--code-span (side num beg end)
+  "Return (SIDE NUM BEG END') for code BEG..END with trailing blanks trimmed.
+Trimming drops difft's inter-column padding so only the code text remains."
+  (let ((e end))
+    (while (and (> e beg) (memq (char-after (1- e)) '(?\s ?\t)))
+      (setq e (1- e)))
+    (list side num beg e)))
+
+(defun difftastic-status--syntax-entries (beg end)
+  "Return per-row code spans for the chunk between BEG and END.
+Each element is (SIDE NUM CODE-BEG CODE-END): SIDE is `old' or `new', NUM the
+1-based source line, and CODE-BEG..CODE-END the buffer span of that row's code
+for that side (gutter excluded).  Entries are in display order."
+  (let ((layout (difftastic-status--chunk-layout beg end))
+        (lines (difftastic-status--parse-chunk-bounds beg end))
+        entries)
+    (pcase layout
+      ('side-by-side
+       (dolist (l lines)
+         (pcase-let ((`((,_bol ,eol) ,left ,right) l))
+           (when (car left)
+             (push (difftastic-status--code-span
+                    'old (car left) (1+ (caddr left))
+                    (if (cadr right) (cadr right) eol))
+                   entries))
+           (when (car right)
+             (push (difftastic-status--code-span
+                    'new (car right) (1+ (caddr right)) eol)
+                   entries)))))
+      ('single-column
+       (let ((re (difftastic-status--single-column-gutter-re)))
+         (dolist (l lines)
+           (pcase-let ((`((,bol ,eol) ,left ,right) l))
+             (let ((side (if (car left) 'old 'new))
+                   (num (or (car left) (car right)))
+                   (cb (save-excursion
+                         (goto-char bol)
+                         (if (and re (looking-at re))
+                             (match-end 0)
+                           (1+ (caddr (or left right)))))))
+               (when num
+                 (push (difftastic-status--code-span side num cb eol)
+                       entries))))))))
+    (nreverse entries)))
+
+(defun difftastic-status--fontify-string (mode text)
+  "Return TEXT fontified with major MODE as a propertized string, or nil.
+Runs MODE in a temp buffer with hooks suppressed and `font-lock-ensure'."
+  (condition-case nil
+      (with-temp-buffer
+        (insert text)
+        (let ((inhibit-message t)
+              (message-log-max nil))
+          (delay-mode-hooks (funcall mode))
+          (font-lock-mode 1)
+          (font-lock-ensure))
+        (buffer-string))
+    (error nil)))
+
+;; difft applies its colours via the `font-lock-face' property (so they survive
+;; font-lock), NOT `face'.  We therefore layer the syntax colour onto
+;; `font-lock-face' as well, otherwise it would be invisible (or stripped by
+;; font-lock) in Magit buffers.
+
+(defun difftastic-status--face-list (val)
+  "Normalize a `font-lock-face' VAL to a list of face specs."
+  (cond ((null val) nil)
+        ((keywordp (car-safe val)) (list val)) ; a single anonymous (plist) face
+        ((listp val) val)                      ; already a list of specs
+        (t (list val))))                       ; a face symbol
+
+(defun difftastic-status--strip-unspecified (plist)
+  "Return anonymous-face PLIST without difft's `unspecified-fg/bg' placeholders.
+difft marks emphasis-only (bold/italic) tokens with `:foreground
+\"unspecified-fg\"'; dropping it lets the syntax colour show through while real
+diff colours (a concrete foreground) are kept."
+  (let (out)
+    (while plist
+      (let ((k (car plist)) (v (cadr plist)))
+        (unless (or (and (eq k :foreground) (equal v "unspecified-fg"))
+                    (and (eq k :background) (equal v "unspecified-bg")))
+          (setq out (append out (list k v)))))
+      (setq plist (cddr plist)))
+    out))
+
+(defun difftastic-status--merge-face (existing syntax)
+  "Return a `font-lock-face' value layering SYNTAX under EXISTING (difft's).
+EXISTING keeps precedence, so a changed token's diff colour wins; SYNTAX fills
+in where difft left the foreground unspecified."
+  (let ((cleaned (delq nil
+                       (mapcar (lambda (e)
+                                 (if (and (consp e) (keywordp (car e)))
+                                     (difftastic-status--strip-unspecified e)
+                                   e))
+                               (difftastic-status--face-list existing)))))
+    (append cleaned (list syntax))))
+
+(defun difftastic-status--apply-face (beg end syntax)
+  "Layer the SYNTAX face under any existing difft `font-lock-face' in BEG..END."
+  (let ((pos beg))
+    (while (< pos end)
+      (let ((nxt (or (next-single-property-change pos 'font-lock-face nil end)
+                     end))
+            (cur (get-text-property pos 'font-lock-face)))
+        (put-text-property pos nxt 'font-lock-face
+                           (difftastic-status--merge-face cur syntax))
+        (setq pos nxt)))))
+
+(defun difftastic-status--copy-faces (src src-off len disp-beg)
+  "Copy font-lock face runs from SRC[SRC-OFF..SRC-OFF+LEN) onto DISP-BEG.
+SRC is a string fontified by the major mode (faces on its `face' property);
+each run is layered onto the display's `font-lock-face' (see
+`difftastic-status--apply-face')."
+  (let ((spos src-off)
+        (send (+ src-off len))
+        (dpos disp-beg))
+    (while (< spos send)
+      (let* ((nxt (or (next-single-property-change spos 'face src send) send))
+             (face (get-text-property spos 'face src))
+             (n (- nxt spos)))
+        (when face
+          (difftastic-status--apply-face dpos (+ dpos n) face))
+        (setq spos nxt dpos (+ dpos n))))))
+
+(defun difftastic-status--apply-syntax-side (mode entries)
+  "Fontify ENTRIES (all one side) with MODE and paint their faces back.
+ENTRIES is a list of (SIDE NUM CODE-BEG CODE-END); rows sharing NUM (difft's
+wrapped continuations) are joined into one logical source line."
+  (let ((src "")
+        (placements nil)
+        (prev-num nil))
+    (pcase-dolist (`(,_side ,num ,cb ,ce) entries)
+      (when (and prev-num (not (eql num prev-num)))
+        (setq src (concat src "\n")))
+      (let ((src-off (length src))
+            (text (buffer-substring-no-properties cb ce)))
+        (setq src (concat src text))
+        (push (list cb (- ce cb) src-off) placements))
+      (setq prev-num num))
+    (when-let* ((fontified (difftastic-status--fontify-string mode src)))
+      (pcase-dolist (`(,disp-beg ,len ,src-off) (nreverse placements))
+        (difftastic-status--copy-faces fontified src-off len disp-beg)))))
+
+;; Whole-file fontification.
+;;
+;; Reconstructing a chunk's source from its displayed rows (above) loses the
+;; surrounding context, so a change inside a multi-line construct -- most often
+;; a docstring/string -- is not recognized as such and stays unhighlighted.  To
+;; fix that we fontify the WHOLE old/new file once (with full context) and map
+;; faces by line number.  The old/new content is fetched per the diff context's
+;; `:old-source'/`:new-source' specs ((worktree) or (blob REV)); when those are
+;; absent or fetching/fontifying fails we fall back to per-chunk reconstruction.
+
+(defvar difftastic-status--syntax-cache nil
+  "Dynamically-bound cache of fontified source vectors for one render.
+Bound to a fresh hash table in `difftastic-status--insert-file-sections' so each
+changed file's old/new source is fetched and fontified at most once per refresh.")
+
+(defun difftastic-status--range-sources (range)
+  "Return (OLD-SPEC . NEW-SPEC) source specs for a diff RANGE, or nil.
+A `A..B'/`A...B' range maps to the two blobs; a bare revision diffs that
+revision against the worktree."
+  (cond
+   ((null range) nil)
+   ((string-match "\\`\\(.*?\\)\\.\\.\\.?\\(.*\\)\\'" range)
+    (cons (list 'blob (let ((a (match-string 1 range)))
+                        (if (string-empty-p a) "HEAD" a)))
+          (list 'blob (let ((b (match-string 2 range)))
+                        (if (string-empty-p b) "HEAD" b)))))
+   (t (cons (list 'blob range) '(worktree)))))
+
+(defun difftastic-status--source-text (file spec)
+  "Return FILE's full text for source SPEC, or nil.
+SPEC is (worktree) -- read from disk -- or (blob REV) -- `git show REV:FILE'
+\(REV may be \"\" for the index)."
+  (pcase spec
+    (`(worktree)
+     (let ((path (expand-file-name file (magit-toplevel))))
+       (when (file-readable-p path)
+         (with-temp-buffer (insert-file-contents path) (buffer-string)))))
+    (`(blob ,rev)
+     (with-temp-buffer
+       (and (eq 0 (process-file "git" nil t nil "--no-pager" "show"
+                                (concat rev ":" file)))
+            (buffer-string))))))
+
+(defun difftastic-status--fontify-lines (mode text)
+  "Return a 1-indexed vector of MODE-fontified lines of TEXT, or nil.
+Element 0 is unused; element N is the propertized Nth line."
+  (when-let* ((fontified (difftastic-status--fontify-string mode text)))
+    (let* ((lines (split-string fontified "\n"))
+           (vec (make-vector (1+ (length lines)) nil))
+           (i 0))
+      (dolist (l lines) (aset vec (setq i (1+ i)) l))
+      vec)))
+
+(defun difftastic-status--source-vec (mode file spec)
+  "Return the fontified line vector for FILE's SPEC side, memoized per render."
+  (when spec
+    (let ((key (cons file spec)))
+      (if (and difftastic-status--syntax-cache
+               (not (eq 'miss (gethash key difftastic-status--syntax-cache 'miss))))
+          (gethash key difftastic-status--syntax-cache)
+        (let ((vec (when-let* ((text (difftastic-status--source-text file spec)))
+                     (difftastic-status--fontify-lines mode text))))
+          (when difftastic-status--syntax-cache
+            (puthash key vec difftastic-status--syntax-cache))
+          vec)))))
+
+(defun difftastic-status--copy-line-faces (srcline off n disp-beg)
+  "Copy face runs from SRCLINE[OFF..OFF+N) onto DISP-BEG in this buffer."
+  (let ((spos off) (send (+ off n)) (dpos disp-beg))
+    (while (< spos send)
+      (let* ((nxt (or (next-single-property-change spos 'face srcline send) send))
+             (face (get-text-property spos 'face srcline))
+             (k (- nxt spos)))
+        (when face (difftastic-status--apply-face dpos (+ dpos k) face))
+        (setq spos nxt dpos (+ dpos k))))))
+
+(defun difftastic-status--apply-syntax-full (entries old-vec new-vec)
+  "Paint faces from whole-file vectors OLD-VEC/NEW-VEC onto ENTRIES.
+Each entry (SIDE NUM CODE-BEG CODE-END) is matched against its source line; a
+wrapped line's rows advance an offset into that line.  Faces are only copied
+when the displayed code matches the source exactly, so any misalignment (e.g.
+tab expansion) is skipped rather than mis-highlighted."
+  (let ((offsets (make-hash-table :test 'equal)))
+    (pcase-dolist (`(,side ,num ,cb ,ce) entries)
+      (let ((vec (if (eq side 'old) old-vec new-vec)))
+        (when (and vec (integerp num) (< num (length vec)))
+          (when-let* ((srcline (aref vec num)))
+            (let* ((okey (cons side num))
+                   (off (gethash okey offsets 0))
+                   (len (- ce cb))
+                   (avail (max 0 (- (length srcline) off)))
+                   (n (min len avail)))
+              (when (and (> n 0)
+                         (string= (substring-no-properties srcline off (+ off n))
+                                  (buffer-substring-no-properties cb (+ cb n))))
+                (difftastic-status--copy-line-faces srcline off n cb))
+              (puthash okey (+ off len) offsets))))))))
+
+(defun difftastic-status--apply-syntax (file beg end context)
+  "Add major-mode syntax highlighting to the chunk FILE between BEG and END.
+Uses whole-file fontification driven by CONTEXT's `:old-source'/`:new-source'
+\(correct context for strings/docstrings); falls back to per-chunk
+reconstruction when no source is available.  No-op when FILE has no recognized
+major mode."
+  (when-let* ((mode (difftastic-status--mode-for-file file))
+              (entries (difftastic-status--syntax-entries beg end)))
+    (let ((old-vec (difftastic-status--source-vec
+                    mode file (plist-get context :old-source)))
+          (new-vec (difftastic-status--source-vec
+                    mode file (plist-get context :new-source))))
+      (if (or old-vec new-vec)
+          (difftastic-status--apply-syntax-full entries old-vec new-vec)
+        ;; Fallback: fontify each side's reconstructed snippet (limited context).
+        (dolist (side '(old new))
+          (when-let* ((side-entries (seq-filter (lambda (e) (eq (car e) side))
+                                                entries)))
+            (difftastic-status--apply-syntax-side mode side-entries)))))))
 
 (defun difftastic-status--region-selected-lines (section)
   "Return (OLD-LINES . NEW-LINES) selected by the active region within SECTION.
@@ -847,6 +1186,8 @@ can rebuild the corresponding git hunk."
                         'font-lock-face difftastic-status-chunk-heading-face))
           (dolist (l body-lines)
             (insert l "\n"))
+          (when difftastic-status-syntax-highlight
+            (difftastic-status--apply-syntax file heading-start (point) context))
           (unless difftastic-status-line-numbers
             (difftastic-status--hide-line-numbers heading-start (point))))))))
 
@@ -989,12 +1330,15 @@ the diff/revision buffers.  The chunk sections are always inserted expanded, so
 expanding a file reveals its hunk(s) -- the same way a single-hunk file feels
 like it expands straight to its diff in Magit."
   ;; Read each file's status once for the whole group (only the difftastic path
-  ;; needs it: for the Magit-matching heading and initial visibility).
+  ;; needs it: for the Magit-matching heading and initial visibility).  A fresh
+  ;; syntax cache is bound for this group so each file's old/new source is
+  ;; fetched and fontified at most once across its chunks.
   (let ((statuses (and (cl-some (lambda (f)
                                   (not (member f difftastic-status--stock-files)))
                                 files)
                        (difftastic-status--file-statuses
-                        (plist-get context :diff-args)))))
+                        (plist-get context :diff-args))))
+        (difftastic-status--syntax-cache (make-hash-table :test 'equal)))
     (dolist (file files)
       (if (member file difftastic-status--stock-files)
           (difftastic-status--insert-stock-file file context)
@@ -1004,12 +1348,14 @@ like it expands straight to its diff in Magit."
   "Diff context plist for the worktree-vs-index (unstaged) diff."
   (list :diff-args difftastic-status--diff-base
         :stock-args '("diff" "-p" "--no-prefix")
+        :old-source '(blob "") :new-source '(worktree)
         :staged nil :stageable t))
 
 (defun difftastic-status--context-staged ()
   "Diff context plist for the index-vs-HEAD (staged) diff."
   (list :diff-args (append difftastic-status--diff-base '("--cached"))
         :stock-args '("diff" "-p" "--no-prefix" "--cached")
+        :old-source '(blob "HEAD") :new-source '(blob "")
         :staged t :stageable t))
 
 (defun difftastic-status-insert-unstaged-changes ()
@@ -1117,17 +1463,24 @@ that names a range/revision is rendered display-only."
       (let* ((selector (append (and range (list range))
                                (and typearg (list typearg))))
              (stock-args (append '("diff" "-p" "--no-prefix") selector))
+             (range-src (difftastic-status--range-sources range))
              (context
               (cond
                ((and (null range) (equal typearg "--cached"))
                 (list :diff-args (append difftastic-status--diff-base selector)
-                      :stock-args stock-args :staged t :stageable t))
+                      :stock-args stock-args
+                      :old-source '(blob "HEAD") :new-source '(blob "")
+                      :staged t :stageable t))
                ((and (null range) (null typearg))
                 (list :diff-args difftastic-status--diff-base
-                      :stock-args stock-args :staged nil :stageable t))
+                      :stock-args stock-args
+                      :old-source '(blob "") :new-source '(worktree)
+                      :staged nil :stageable t))
                (t
                 (list :diff-args (append difftastic-status--diff-base selector)
-                      :stock-args stock-args :staged nil :stageable nil))))
+                      :stock-args stock-args
+                      :old-source (car range-src) :new-source (cdr range-src)
+                      :staged nil :stageable nil))))
              (files (apply #'difftastic-status--git-lines
                            (append '("--no-pager" "diff" "--name-only")
                                    selector '("--") diff-files))))
@@ -1148,6 +1501,8 @@ Magit's stock inserter."
            (context (list :diff-args (append difftastic-status--show-base (list commit))
                           :stock-args (append '("show" "-p" "--format=" "--no-prefix")
                                               (list commit))
+                          :old-source (list 'blob (concat commit "^"))
+                          :new-source (list 'blob commit)
                           :staged nil :stageable nil))
            (files (apply #'difftastic-status--git-lines
                          (append '("--no-pager" "show" "--name-only" "--format=")

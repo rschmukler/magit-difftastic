@@ -220,18 +220,21 @@ CONTENT is the body start; VALUE, when given, is stored as the section value."
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
       `(("sample.txt" . ,dst-test--new))
     (dolist (display dst-test--displays)
-      (with-temp-buffer
-        (insert (dst-test--chunk-buffer-string "sample.txt" display))
-        (let* ((bounds (cons (point-min) (point-max)))
-               (expected (if (equal display "inline") 'single-column 'side-by-side))
-               (lines (difftastic-status--parse-chunk-bounds (point-min) (point-max))))
-          (should (eq (difftastic--classify-chunk bounds) expected))
-          (should lines)
-          ;; Every old/new number difft reports is a real file line (1..7).
-          (dolist (l lines)
-            (pcase-let ((`(,_ ,left ,right) l))
-              (when (car left)  (should (<= 1 (car left) 7)))
-              (when (car right) (should (<= 1 (car right) 7))))))))))
+      (let ((difftastic-status-display display))
+        (with-temp-buffer
+          (insert (dst-test--chunk-buffer-string "sample.txt" display))
+          (let ((expected (if (equal display "inline")
+                              'single-column 'side-by-side))
+                (lines (difftastic-status--parse-chunk-bounds
+                        (point-min) (point-max))))
+            (should (eq (difftastic-status--chunk-layout (point-min) (point-max))
+                        expected))
+            (should lines)
+            ;; Every old/new number difft reports is a real file line (1..7).
+            (dolist (l lines)
+              (pcase-let ((`(,_ ,left ,right) l))
+                (when (car left)  (should (<= 1 (car left) 7)))
+                (when (car right) (should (<= 1 (car right) 7)))))))))))
 
 ;;;; Integration: region (line-range) staging ------------------------------
 
@@ -243,7 +246,8 @@ side-by-side the row carries both sides, so the whole modification is staged."
   (dolist (display dst-test--displays)
     (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
         `(("sample.txt" . ,dst-test--new))
-      (with-temp-buffer
+      (let ((difftastic-status-display display))
+       (with-temp-buffer
         (insert (dst-test--chunk-buffer-string "sample.txt" display))
         (goto-char (point-min))
         (let ((sec (dst-test--make-section
@@ -267,7 +271,7 @@ side-by-side the row carries both sides, so the whole modification is staged."
                 (should-not (string-match-p "golf-added" staged))
                 (if (equal display "inline")
                     (should-not (string-match-p "^-delta$" staged))
-                  (should (string-match-p "^-delta$" staged)))))))))))
+                  (should (string-match-p "^-delta$" staged))))))))))))
 
 ;;;; Integration: whole-chunk staging --------------------------------------
 
@@ -299,7 +303,8 @@ side-by-side the row carries both sides, so the whole modification is staged."
   (skip-unless (fboundp 'difftastic--classify-chunk))
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
       `(("sample.txt" . ,dst-test--new))
-    (with-temp-buffer
+    (let ((difftastic-status-display "side-by-side-show-both"))
+     (with-temp-buffer
       (insert (dst-test--chunk-buffer-string "sample.txt" "side-by-side-show-both"))
       (difftastic-status--hide-line-numbers (point-min) (point-max))
       ;; The first body row's leading digit is visually blanked, text intact.
@@ -321,7 +326,7 @@ side-by-side the row carries both sides, so the whole modification is staged."
         (dst-test--with-region (line-beginning-position) (line-end-position)
           (let ((sel (difftastic-status--region-selected-lines sec)))
             (should (memq 4 (car sel)))
-            (should (memq 4 (cdr sel)))))))))
+            (should (memq 4 (cdr sel))))))))))
 
 ;;;; Integration: file statuses --------------------------------------------
 
@@ -339,6 +344,82 @@ side-by-side the row carries both sides, so the whole modification is staged."
       (should (equal (car (cdr (assoc "gone.txt" statuses))) "deleted"))
       ;; A brand new file is untracked, so it is not part of the tracked diff.
       (should-not (assoc "fresh.txt" statuses)))))
+
+;;;; Unit tests: major-mode detection -------------------------------------
+
+(ert-deftest difftastic-status--mode-for-file/recognizes-and-rejects ()
+  (let ((mode (difftastic-status--mode-for-file "foo.el")))
+    (should (and mode (fboundp mode))))
+  (should-not (difftastic-status--mode-for-file "foo.no-such-ext-zzz")))
+
+;;;; Integration: syntax highlighting --------------------------------------
+
+(defun dst-test--faces-at (pos)
+  "Return the `font-lock-face' property at POS as a list.
+difft and our syntax highlighting both colour via `font-lock-face'."
+  (let ((f (get-text-property pos 'font-lock-face)))
+    (if (listp f) f (list f))))
+
+(defun dst-test--face-present-p (face)
+  "Return non-nil if FACE appears in any `font-lock-face' property."
+  (save-excursion
+    (goto-char (point-min))
+    (cl-loop while (< (point) (point-max))
+             when (memq face (dst-test--faces-at (point))) return t
+             do (goto-char (or (next-single-property-change
+                                (point) 'font-lock-face)
+                               (point-max))))))
+
+(ert-deftest difftastic-status-integration/syntax-highlight-applies-faces ()
+  "Major-mode font-lock faces are layered onto code in every layout."
+  (skip-unless dst-test--have-tools)
+  (dolist (display dst-test--displays)
+    (dst-test--with-repo
+        '(("sample.el" . "(defun greet (name)\n  (message \"hi %s\" name))\n"))
+        '(("sample.el" . "(defun greet (name greeting)\n  ;; say hi\n  (message \"%s %s\" greeting name))\n"))
+      (let ((difftastic-status-display display))
+       (with-temp-buffer
+        (insert (dst-test--chunk-buffer-string "sample.el" display))
+        (difftastic-status--apply-syntax "sample.el" (point-min) (point-max)
+                                         (difftastic-status--context-unstaged))
+        ;; `defun' is fontified as a keyword ...
+        (goto-char (point-min))
+        (should (search-forward "defun" nil t))
+        (should (memq 'font-lock-keyword-face
+                      (dst-test--faces-at (match-beginning 0))))
+        ;; ... and the added comment carries the comment face somewhere.
+        (should (dst-test--face-present-p 'font-lock-comment-face)))))))
+
+(ert-deftest difftastic-status-integration/syntax-highlight-docstring-context ()
+  "A change inside a multi-line docstring is highlighted as a string/doc.
+Per-chunk reconstruction misses this (the opening quote is out of view); the
+whole-file fontification path recognizes the enclosing string."
+  (skip-unless dst-test--have-tools)
+  (dolist (display dst-test--displays)
+    (dst-test--with-repo
+        '(("d.el" . "(defun foo ()\n  \"Line one.\nLine two old.\nLine three.\"\n  1)\n"))
+        '(("d.el" . "(defun foo ()\n  \"Line one.\nLine two NEW.\nLine three.\"\n  1)\n"))
+      (let ((difftastic-status-display display))
+       (with-temp-buffer
+        (insert (dst-test--chunk-buffer-string "d.el" display))
+        (difftastic-status--apply-syntax "d.el" (point-min) (point-max)
+                                         (difftastic-status--context-unstaged))
+        (should (or (dst-test--face-present-p 'font-lock-doc-face)
+                    (dst-test--face-present-p 'font-lock-string-face))))))))
+
+(ert-deftest difftastic-status-integration/syntax-highlight-noop-unknown-mode ()
+  "A file with no recognized major mode gets no font-lock faces."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("data.no-such-ext-zzz" . "alpha\nbravo\n"))
+      '(("data.no-such-ext-zzz" . "alpha\nBRAVO\ncharlie\n"))
+    (let ((difftastic-status-display "side-by-side-show-both"))
+      (with-temp-buffer
+        (insert (dst-test--chunk-buffer-string "data.no-such-ext-zzz"
+                                               "side-by-side-show-both"))
+        (difftastic-status--apply-syntax "data.no-such-ext-zzz"
+                                         (point-min) (point-max)
+                                         (difftastic-status--context-unstaged))
+        (should-not (dst-test--face-present-p 'font-lock-keyword-face))))))
 
 (provide 'difftastic-status-test)
 ;;; difftastic-status-test.el ends here
