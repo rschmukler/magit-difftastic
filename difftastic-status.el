@@ -40,6 +40,18 @@
 ;; difftastic chunk (or selected region) at point.  When the mode is off,
 ;; Magit's stock sections are used, so you can always fall back.
 ;;
+;; The same difftastic chunks are also rendered in `magit-diff-mode' buffers --
+;; which includes the diff Magit shows while you compose a commit message -- and
+;; in `magit-revision-mode' buffers (viewing a commit), by advising Magit's
+;; `magit-insert-diff'/`magit-insert-revision-diff'.  Per-chunk (and region)
+;; staging is offered only where it is meaningful: the worktree (unstaged) and
+;; `--cached' (staged) diffs.  Diffs that merely compare two revisions (a range
+;; diff, or a commit being viewed) are rendered display-only.  These two
+;; integrations can be scoped with `difftastic-status-diff-buffers' and
+;; `difftastic-status-revision-buffers' (both default on); anything difftastic
+;; cannot render -- `--no-index' diffs, merge commits shown as combined diffs --
+;; falls straight back to Magit's stock rendering.
+;;
 ;; Evil integration is optional and installed gracefully: if `evil' is present
 ;; the staging keys are bound in the relevant magit maps; if not, nothing is
 ;; assumed and the package works with stock Emacs keybindings.
@@ -90,6 +102,10 @@
 ;;     large change sets this can make `magit-status' sluggish.
 ;;   - Untracked files are still rendered by the stock
 ;;     `magit-insert-untracked-files'.
+;;   - In `magit-diff-mode'/`magit-revision-mode' buffers the difftastic
+;;     rendering replaces Magit's diff section wholesale, so the usual diffstat
+;;     header is not shown there.  Merge commits (combined diffs) and
+;;     `--no-index' diffs fall back to Magit's stock rendering.
 ;;
 ;; Toggle with `difftastic-status-mode' (global).  When off, Magit's
 ;; stock unstaged/staged sections are used, so you can always fall back.
@@ -129,15 +145,25 @@ hunk-heading look."
   "Width (in columns) to request from difft for the status buffer."
   (max 40 (- (window-body-width (get-buffer-window (current-buffer) t)) 2)))
 
-(defun difftastic-status--file-diff-string (file &optional staged)
+(defconst difftastic-status--diff-base '("--no-pager" "diff" "--ext-diff")
+  "Leading git invocation for difftastic `git diff' rendering.
+The diff selector (e.g. `--cached', a range) and the `-- FILE' pathspec are
+appended to this.")
+
+(defconst difftastic-status--show-base '("--no-pager" "show" "--ext-diff" "--format=")
+  "Leading git invocation for difftastic `git show' (commit) rendering.
+The revision and the `-- FILE' pathspec are appended to this.")
+
+(defun difftastic-status--file-diff-string (file diff-args)
   "Return the difftastic-rendered, fontified diff STRING for FILE.
-When STAGED is non-nil diff the index against HEAD (\"--cached\");
-otherwise diff the worktree against the index."
+DIFF-ARGS is the leading git invocation (including `--no-pager', the
+subcommand and `--ext-diff') that selects which diff to render; FILE is
+appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
+\"--cached\")' renders the index against HEAD, while
+`(\"--no-pager\" \"show\" \"--ext-diff\" \"--format=\" REV)' renders a commit."
   (require 'difftastic)
   (let* ((width (difftastic-status--width))
-         (args (append '("--no-pager" "diff" "--ext-diff")
-                       (when staged '("--cached"))
-                       (list "--" file)))
+         (args (append diff-args (list "--" file)))
          (raw (with-temp-buffer
                 ;; `difftastic--build-git-process-environment' sets
                 ;; GIT_EXTERNAL_DIFF=difft ... so plain `git diff --ext-diff'
@@ -196,7 +222,7 @@ custom `difftastic-hunk' sections do not have."
              (line (or (and val (ignore-errors
                                   (difftastic-status--chunk-visit-line
                                    (plist-get val :file)
-                                   (plist-get val :staged)
+                                   (plist-get val :diff-args)
                                    (plist-get val :index))))
                        (and val (plist-get val :line)))))
         (find-file (expand-file-name file (magit-toplevel)))
@@ -266,10 +292,10 @@ and :text (the exact patch text for that hunk, including its @@ line)."
       (flush))
     (cons header (nreverse hunks))))
 
-(defun difftastic-status--chunk-json (file staged index)
+(defun difftastic-status--chunk-json (file diff-args index)
   "Return difft's JSON rows (a list) for chunk INDEX of FILE, or nil.
-Each row is an alist with `lhs'/`rhs' entries.  STAGED selects the
-index-vs-HEAD diff."
+Each row is an alist with `lhs'/`rhs' entries.  DIFF-ARGS is the leading git
+invocation that selects the diff (see `difftastic-status--file-diff-string')."
   (require 'difftastic)
   (let* ((width (difftastic-status--width))
          (json (with-temp-buffer
@@ -278,9 +304,7 @@ index-vs-HEAD diff."
                               (difftastic--build-git-process-environment
                                width '("--display" "json")))))
                    (apply #'process-file "git" nil t nil
-                          (append '("--no-pager" "diff" "--ext-diff")
-                                  (when staged '("--cached"))
-                                  (list "--" file))))
+                          (append diff-args (list "--" file))))
                  (buffer-string)))
          (data (ignore-errors
                  (json-parse-string json
@@ -290,11 +314,12 @@ index-vs-HEAD diff."
                                     :false-object nil))))
     (and data (nth index (alist-get 'chunks data)))))
 
-(defun difftastic-status--json-chunk-lines (file staged index)
+(defun difftastic-status--json-chunk-lines (file diff-args index)
   "Return (OLD-LINES . NEW-LINES), 1-indexed, for difft chunk INDEX of FILE.
 OLD-LINES/NEW-LINES are the lhs/rhs line numbers difftastic reports for the
-changed rows of that chunk.  STAGED selects the index-vs-HEAD diff."
-  (let ((chunk (difftastic-status--chunk-json file staged index))
+changed rows of that chunk.  DIFF-ARGS selects the diff (see
+`difftastic-status--file-diff-string')."
+  (let ((chunk (difftastic-status--chunk-json file diff-args index))
         (old nil)
         (new nil))
     (dolist (row chunk)
@@ -306,17 +331,18 @@ changed rows of that chunk.  STAGED selects the index-vs-HEAD diff."
           (push (1+ (alist-get 'line_number rhs)) new))))
     (cons (nreverse old) (nreverse new))))
 
-(defun difftastic-status--chunk-visit-line (file staged index)
+(defun difftastic-status--chunk-visit-line (file diff-args index)
   "Return the 1-based line of chunk INDEX's first change in FILE, or nil.
 Prefers the first new-side (rhs) line so visiting lands exactly on the change
 in the worktree; falls back to the first old-side (lhs) line for a pure
-deletion.  STAGED selects the diff.
+deletion.  DIFF-ARGS selects the diff (see
+`difftastic-status--file-diff-string').
 
 \(We deliberately do not try to compute a column: difft only marks changed
 tokens for recognized languages -- for plain text every span is `normal' --
 so a JSON-derived column would be misleading.  Visiting lands on the line and
 its first non-whitespace character instead.)"
-  (let ((chunk (difftastic-status--chunk-json file staged index)))
+  (let ((chunk (difftastic-status--chunk-json file diff-args index)))
     (cl-flet ((first-line (side)
                 (cl-loop for row in chunk
                          for s = (alist-get side row)
@@ -349,10 +375,11 @@ difftastic chunk maps onto."
          (file (plist-get val :file))
          (index (plist-get val :index))
          (staged (plist-get val :staged))
+         (diff-args (plist-get val :diff-args))
          (parsed (difftastic-status--parse-diff (difftastic-status--git-diff-raw file staged)))
          (header (car parsed))
          (hunks (cdr parsed))
-         (lines (difftastic-status--json-chunk-lines file staged index))
+         (lines (difftastic-status--json-chunk-lines file diff-args index))
          (matched (cl-remove-if-not
                    (lambda (h) (difftastic-status--hunk-covers-p h (car lines) (cdr lines)))
                    hunks)))
@@ -498,14 +525,24 @@ for the selected lines; otherwise build the whole-chunk patch.  Signals a
 ;; Core operations -- assume point is on a difftastic chunk SECTION.
 ;; Each op honors an active region (line-range staging) via
 ;; `difftastic-status--patch-for'; with no region it operates on the whole chunk.
+(defun difftastic-status--ensure-stageable (section)
+  "Signal a `user-error' unless chunk SECTION supports staging.
+Chunks rendered for a diff that merely compares two revisions (a range diff,
+or a commit being viewed) carry `:stageable' nil: there is no index or
+worktree to apply a patch to."
+  (unless (plist-get (oref section value) :stageable)
+    (user-error "Staging is not available here; this diff only compares revisions")))
+
 (defun difftastic-status--stage-chunk-1 (section)
   "Stage the change(s) covered by chunk SECTION (or the selected region)."
+  (difftastic-status--ensure-stageable section)
   (if (plist-get (oref section value) :staged)
       (user-error "This chunk is already staged")
     (difftastic-status--apply-chunk-patch (difftastic-status--patch-for section "-") "--cached")))
 
 (defun difftastic-status--unstage-chunk-1 (section)
   "Unstage the change(s) covered by chunk SECTION (or the selected region)."
+  (difftastic-status--ensure-stageable section)
   (if (plist-get (oref section value) :staged)
       (difftastic-status--apply-chunk-patch
        (difftastic-status--patch-for section "+") "--cached" "--reverse")
@@ -513,6 +550,7 @@ for the selected lines; otherwise build the whole-chunk patch.  Signals a
 
 (defun difftastic-status--discard-chunk-1 (section)
   "Discard the worktree change(s) covered by chunk SECTION (or the region)."
+  (difftastic-status--ensure-stageable section)
   (if (plist-get (oref section value) :staged)
       (user-error "Discarding a staged chunk is not supported; unstage it first")
     (let ((patch (difftastic-status--patch-for section "+")))
@@ -597,12 +635,14 @@ Difftastic inline rows are prefixed with a right-aligned line number."
                (match-string 1 l)))
            body-lines))
 
-(defun difftastic-status--insert-chunk (body-lines file index staged)
+(defun difftastic-status--insert-chunk (body-lines file index context)
   "Insert one collapsible chunk section from BODY-LINES (difft header removed).
-FILE is the repo-relative path, INDEX is the chunk's 0-based position in the
-file's difftastic output (matching `difft --display json' chunk order), and
-STAGED records whether this is the index-vs-HEAD diff.  These are stored on the
-section value so the staging commands can rebuild the corresponding git hunk."
+FILE is the repo-relative path and INDEX is the chunk's 0-based position in the
+file's difftastic output (matching `difft --display json' chunk order).
+CONTEXT is the diff context plist (see
+`difftastic-status--insert-file-sections'); its `:diff-args', `:staged' and
+`:stageable' entries are stored on the section value so the staging commands
+can rebuild the corresponding git hunk."
   ;; Drop leading/trailing blank lines that difft puts between chunks.
   (while (and body-lines (string-blank-p (car body-lines)))
     (setq body-lines (cdr body-lines)))
@@ -614,19 +654,22 @@ section value so the staging commands can rebuild the corresponding git hunk."
     (let* ((start (difftastic-status--chunk-start-line body-lines))
            (heading (if start (format "@@ line %s @@" start) "@@ @@")))
       (magit-insert-section (difftastic-hunk
-                             (list :file file :index index :staged staged
+                             (list :file file :index index
+                                   :diff-args (plist-get context :diff-args)
+                                   :staged (plist-get context :staged)
+                                   :stageable (plist-get context :stageable)
                                    :line (and start (string-to-number start))))
         (magit-insert-heading
           (propertize heading 'font-lock-face difftastic-status-chunk-heading-face))
         (dolist (l body-lines)
           (insert l "\n"))))))
 
-(defun difftastic-status--insert-chunks (rendered file staged)
+(defun difftastic-status--insert-chunks (rendered file context)
   "Split RENDERED difftastic output for FILE into collapsible per-chunk sections.
 Difftastic's own `FILE --- N/M --- LANG' headers are consumed (not shown).
 The chunk INDEX passed to `difftastic-status--insert-chunk' increments once per
 difftastic chunk header so it stays aligned with `difft --display json'.
-STAGED selects worktree vs. index diff."
+CONTEXT is the diff context plist threaded down to each chunk section."
   (let ((header-re (difftastic--chunk-regexp t))
         (lines (split-string rendered "\n"))
         (chunk nil)
@@ -636,32 +679,49 @@ STAGED selects worktree vs. index diff."
       (if (string-match-p header-re line)
           (progn
             (when started
-              (difftastic-status--insert-chunk (nreverse chunk) file index staged))
+              (difftastic-status--insert-chunk (nreverse chunk) file index context))
             (setq chunk nil started t index (1+ index)))
         (when started
           (push line chunk))))
     (when started
-      (difftastic-status--insert-chunk (nreverse chunk) file index staged))))
+      (difftastic-status--insert-chunk (nreverse chunk) file index context))))
 
-(defun difftastic-status--insert-file-sections (files staged)
+(defun difftastic-status--insert-file-sections (files context)
   "Insert a collapsible difftastic `file' section for each of FILES.
 Files are contiguous (no blank line between them); the only blank line is
 inserted after the whole section (see the top-level inserters).
-STAGED selects worktree vs. index diff (see
-`difftastic-status--file-diff-string')."
-  (dolist (file files)
-    (magit-insert-section (file file)
-      (magit-insert-heading
-        (propertize file 'font-lock-face 'magit-filename))
-      (difftastic-status--insert-chunks (difftastic-status--file-diff-string file staged)
-                                  file staged))))
+CONTEXT is a diff context plist with the entries:
+  :diff-args  the leading git invocation selecting the diff to render
+              (see `difftastic-status--file-diff-string');
+  :staged     non-nil when the diff is the index against HEAD;
+  :stageable  non-nil when per-chunk staging is meaningful in this buffer.
+It is threaded down to every chunk section so the staging commands can rebuild
+the corresponding git hunk."
+  (let ((diff-args (plist-get context :diff-args)))
+    (dolist (file files)
+      (magit-insert-section (file file)
+        (magit-insert-heading
+          (propertize file 'font-lock-face 'magit-filename))
+        (difftastic-status--insert-chunks
+         (difftastic-status--file-diff-string file diff-args)
+         file context)))))
+
+(defun difftastic-status--context-unstaged ()
+  "Diff context plist for the worktree-vs-index (unstaged) diff."
+  (list :diff-args difftastic-status--diff-base :staged nil :stageable t))
+
+(defun difftastic-status--context-staged ()
+  "Diff context plist for the index-vs-HEAD (staged) diff."
+  (list :diff-args (append difftastic-status--diff-base '("--cached"))
+        :staged t :stageable t))
 
 (defun difftastic-status-insert-unstaged-changes ()
   "Difftastic replacement for `magit-insert-unstaged-changes'."
   (when-let* ((files (magit-unstaged-files)))
     (magit-insert-section (unstaged)
       (magit-insert-heading t "Unstaged changes")
-      (difftastic-status--insert-file-sections files nil))
+      (difftastic-status--insert-file-sections
+       files (difftastic-status--context-unstaged)))
     ;; Trailing blank line OUTSIDE the section, so it remains a stable
     ;; separator before the next section even when this one is collapsed.
     (insert "\n")))
@@ -672,8 +732,127 @@ STAGED selects worktree vs. index diff (see
     (when-let* ((files (magit-staged-files)))
       (magit-insert-section (staged)
         (magit-insert-heading t "Staged changes")
-        (difftastic-status--insert-file-sections files t))
+        (difftastic-status--insert-file-sections
+         files (difftastic-status--context-staged)))
       (insert "\n"))))
+
+;;; Diff- and revision-buffer rendering
+;;
+;; The same difftastic chunk sections are inserted into `magit-diff-mode'
+;; buffers (which includes the diff Magit shows while you compose a commit
+;; message) and `magit-revision-mode' buffers (viewing a commit) by advising
+;; Magit's `magit-insert-diff' / `magit-insert-revision-diff' section inserters.
+;; We use `:around' advice -- not `:override' -- so that anything difftastic
+;; cannot (or should not) render falls straight back to Magit's stock inserter:
+;; `--no-index' diffs, merge commits shown as combined diffs, and so on.
+;;
+;; Per-chunk staging is enabled only where it is meaningful: the worktree
+;; (unstaged) and `--cached' (staged) diff buffers.  Anything that compares two
+;; revisions -- a range diff, or a commit being viewed -- is rendered
+;; display-only (`:stageable' nil; see `difftastic-status--ensure-stageable').
+
+(defcustom difftastic-status-diff-buffers t
+  "Whether to render `magit-diff-mode' buffers with difftastic chunks.
+This includes the diff Magit shows while you compose a commit message (which is
+itself a `magit-diff-mode' buffer).  When nil, those buffers keep Magit's stock
+rendering even while `difftastic-status-mode' is enabled."
+  :type 'boolean
+  :group 'difftastic-status)
+
+(defcustom difftastic-status-revision-buffers t
+  "Whether to render `magit-revision-mode' buffers with difftastic chunks.
+When nil, viewing a commit keeps Magit's stock rendering even while
+`difftastic-status-mode' is enabled."
+  :type 'boolean
+  :group 'difftastic-status)
+
+;; These are buffer-local variables Magit sets in its diff/revision buffers;
+;; declare them special to keep the byte-compiler quiet.
+(defvar magit-buffer-range)
+(defvar magit-buffer-typearg)
+(defvar magit-buffer-diff-files)
+(defvar magit-buffer-revision)
+
+(defun difftastic-status--git-lines (&rest args)
+  "Run \"git ARGS...\" and return its non-empty output lines as a list."
+  (with-temp-buffer
+    (apply #'process-file "git" nil t nil args)
+    (split-string (buffer-string) "\n" t)))
+
+(defun difftastic-status--diff-context ()
+  "Return a (CONTEXT . FILES) pair for the current `magit-diff-mode' buffer.
+CONTEXT is the diff context plist (see
+`difftastic-status--insert-file-sections') and FILES is the list of changed
+files.  Returns nil when the buffer's diff
+cannot (or should not) be rendered with difftastic -- e.g. a `--no-index' diff,
+or a diff with no files -- so the caller can fall back to Magit's stock
+inserter.
+
+The diff is classified from Magit's buffer-locals: with no range, `--cached'
+means the index against HEAD (unstaging a chunk is meaningful) and no typearg
+means the worktree against the index (staging a chunk is meaningful); anything
+that names a range/revision is rendered display-only."
+  (let ((range magit-buffer-range)
+        (typearg magit-buffer-typearg)
+        (diff-files magit-buffer-diff-files))
+    (unless (equal typearg "--no-index")
+      (let* ((selector (append (and range (list range))
+                               (and typearg (list typearg))))
+             (context
+              (cond
+               ((and (null range) (equal typearg "--cached"))
+                (list :diff-args (append difftastic-status--diff-base selector)
+                      :staged t :stageable t))
+               ((and (null range) (null typearg))
+                (list :diff-args difftastic-status--diff-base
+                      :staged nil :stageable t))
+               (t
+                (list :diff-args (append difftastic-status--diff-base selector)
+                      :staged nil :stageable nil))))
+             (files (apply #'difftastic-status--git-lines
+                           (append '("--no-pager" "diff" "--name-only")
+                                   selector '("--") diff-files))))
+        (and files (cons context files))))))
+
+(defun difftastic-status--revision-context ()
+  "Return a (CONTEXT . FILES) pair for the current `magit-revision-mode' buffer.
+CONTEXT is a display-only diff context plist rendering the commit with
+`git show', and FILES is the commit's changed files.  Returns nil when there is
+nothing difftastic can render (no revision, or a merge commit shown as a
+combined diff, which has no `--name-only' files), so the caller can fall back to
+Magit's stock inserter."
+  (when-let* ((rev magit-buffer-revision))
+    ;; Peel to the underlying commit so viewing a tag shows the commit's diff
+    ;; (mirrors Magit's `magit--rev-dereference').
+    (let* ((commit (concat rev "^{commit}"))
+           (diff-files magit-buffer-diff-files)
+           (context (list :diff-args (append difftastic-status--show-base (list commit))
+                          :staged nil :stageable nil))
+           (files (apply #'difftastic-status--git-lines
+                         (append '("--no-pager" "show" "--name-only" "--format=")
+                                 (list commit) '("--") diff-files))))
+      (and files (cons context files)))))
+
+(defun difftastic-status--insert-diff-advice (orig &rest args)
+  "Around-advice for `magit-insert-diff' rendering chunks with difftastic.
+Falls back to ORIG (called with ARGS) when difftastic should not handle the
+current `magit-diff-mode' buffer."
+  (let ((ctx (and difftastic-status-diff-buffers
+                  (ignore-errors (difftastic-status--diff-context)))))
+    (if ctx
+        (difftastic-status--insert-file-sections (cdr ctx) (car ctx))
+      (apply orig args))))
+
+(defun difftastic-status--insert-revision-diff-advice (orig &rest args)
+  "Around-advice for `magit-insert-revision-diff' rendering chunks with difftastic.
+Falls back to ORIG (called with ARGS) when difftastic should not handle the
+current `magit-revision-mode' buffer.  Like Magit's own inserter, the per-file
+sections are inserted directly (no extra wrapping section)."
+  (let ((ctx (and difftastic-status-revision-buffers
+                  (ignore-errors (difftastic-status--revision-context)))))
+    (if ctx
+        (difftastic-status--insert-file-sections (cdr ctx) (car ctx))
+      (apply orig args))))
 
 (defconst difftastic-status--evil-keys
   '(("s" . difftastic-status-stage-chunk)
@@ -710,10 +889,16 @@ evil-collection-magit[-section] puts there."
 
 While enabled, `magit-insert-unstaged-changes' and
 `magit-insert-staged-changes' are overridden so the status buffer shows
-collapsible, difftastic-rendered, per-file sections, and the magit
-stage/unstage/discard/visit commands are advised so that, while point is on
-a difftastic chunk, they act on just that chunk (otherwise unchanged).  Evil
-visual-state keys are also bound so region (line-range) staging works."
+collapsible, difftastic-rendered, per-file sections.  `magit-insert-diff' and
+`magit-insert-revision-diff' are likewise advised so `magit-diff-mode' buffers
+\(including the diff shown while composing a commit) and `magit-revision-mode'
+buffers (viewing a commit) get the same difftastic chunks; this can be scoped
+with `difftastic-status-diff-buffers' and `difftastic-status-revision-buffers'.
+The magit stage/unstage/discard/visit commands are advised so that, while point
+is on a difftastic chunk, they act on just that chunk (otherwise unchanged) --
+staging is offered only where it is meaningful (the worktree and `--cached'
+diffs).  Evil visual-state keys are also bound so region (line-range) staging
+works."
   :global t
   :group 'difftastic-status
   (if difftastic-status-mode
@@ -722,6 +907,10 @@ visual-state keys are also bound so region (line-range) staging works."
                     #'difftastic-status-insert-unstaged-changes)
         (advice-add 'magit-insert-staged-changes :override
                     #'difftastic-status-insert-staged-changes)
+        (advice-add 'magit-insert-diff :around
+                    #'difftastic-status--insert-diff-advice)
+        (advice-add 'magit-insert-revision-diff :around
+                    #'difftastic-status--insert-revision-diff-advice)
         (pcase-dolist (`(,cmd . ,advice) difftastic-status--advices)
           (advice-add cmd :around advice))
         (difftastic-status--set-evil-keys t))
@@ -729,14 +918,19 @@ visual-state keys are also bound so region (line-range) staging works."
                    #'difftastic-status-insert-unstaged-changes)
     (advice-remove 'magit-insert-staged-changes
                    #'difftastic-status-insert-staged-changes)
+    (advice-remove 'magit-insert-diff
+                   #'difftastic-status--insert-diff-advice)
+    (advice-remove 'magit-insert-revision-diff
+                   #'difftastic-status--insert-revision-diff-advice)
     (pcase-dolist (`(,cmd . ,advice) difftastic-status--advices)
       (advice-remove cmd advice))
     (difftastic-status--set-evil-keys nil))
-  ;; Refresh any visible status buffers so the change is immediately visible.
+  ;; Refresh any visible status/diff/revision buffers so the change is
+  ;; immediately visible (`magit-revision-mode' derives from `magit-diff-mode').
   (when (fboundp 'magit-refresh)
     (dolist (buf (buffer-list))
       (with-current-buffer buf
-        (when (derived-mode-p 'magit-status-mode)
+        (when (derived-mode-p 'magit-status-mode 'magit-diff-mode)
           (magit-refresh))))))
 
 (provide 'difftastic-status)

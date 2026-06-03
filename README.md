@@ -42,9 +42,19 @@ Unstaged changes (2)
   - **Chunk level** — `s` / `u` / `k` on a chunk act on just that chunk.
   - **Line-range level** — with an active region inside a chunk, the same keys
     act on only the selected lines.
+- **Beyond `magit-status`** — the same difftastic chunks also render in
+  `magit-diff-mode` buffers (including the diff Magit shows while you compose a
+  commit message) and in `magit-revision-mode` (viewing a commit). Per-chunk /
+  line-range staging stays available where it is meaningful — the worktree
+  (unstaged) and `--cached` (staged) diffs — while diffs that merely compare two
+  revisions (a range diff, or a commit being viewed) are rendered display-only.
+  Anything difftastic can't render (`--no-index` diffs, merge commits shown as a
+  combined diff) falls straight back to Magit's stock rendering.
 - **Toggleable** — `difftastic-status-mode` is a global minor mode. Turn it off
   and Magit's stock unstaged/staged sections come right back, so you always
-  have a fallback.
+  have a fallback. The diff- and revision-buffer integrations can be scoped
+  independently with `difftastic-status-diff-buffers` and
+  `difftastic-status-revision-buffers`.
 - **Optional, graceful Evil integration** — if [Evil][evil] is present the
   staging keys are bound in the relevant magit maps; if not, nothing is
   assumed and the package works with stock Emacs keybindings.
@@ -145,6 +155,8 @@ step is skipped entirely — no hard dependency, nothing assumed.
 | `difftastic-status-display`              | `"inline"`   | Value passed to `difft --display`. `inline` is strongly recommended; line-range staging relies on its one-row-per-line layout. |
 | `difftastic-status-chunk-heading-face`   | `magit-hash` | Face for the per-chunk `@@ line N @@` headings.                             |
 | `difftastic-status-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
+| `difftastic-status-diff-buffers`         | `t`          | Render `magit-diff-mode` buffers (including the commit-message preview) with difftastic chunks. |
+| `difftastic-status-revision-buffers`     | `t`          | Render `magit-revision-mode` buffers (viewing a commit) with difftastic chunks. |
 
 ## How it works
 
@@ -175,9 +187,14 @@ the magit commands, which is binding- and evil-state-agnostic.
   Magit's own per-hunk staging uses.
 - `difft` is run synchronously, once per changed file, on every status refresh
   (plus one extra `difft --display json` per staging action). On large change
-  sets this can make `magit-status` sluggish.
+  sets this can make `magit-status` sluggish. The same cost applies to the
+  difftastic-rendered diff and revision buffers.
 - Untracked files are still rendered by the stock
   `magit-insert-untracked-files`.
+- In `magit-diff-mode` / `magit-revision-mode` buffers the difftastic rendering
+  replaces Magit's diff section wholesale, so the usual diffstat header is not
+  shown there. Merge commits (shown as a combined diff) and `--no-index` diffs
+  are left to Magit's stock rendering.
 
 ## License
 
