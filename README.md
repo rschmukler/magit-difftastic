@@ -158,7 +158,7 @@ step is skipped entirely — no hard dependency, nothing assumed.
 
 | Variable                                 | Default      | Description                                                                 |
 |------------------------------------------|--------------|-----------------------------------------------------------------------------|
-| `difftastic-status-display`              | `"inline"`   | Layout passed to `difft --display`: `"inline"`, `"side-by-side"`, or `"side-by-side-show-both"`. All support per-chunk and line-range staging. |
+| `difftastic-status-display`              | `"side-by-side"` | Layout passed to `difft --display`: `"inline"`, `"side-by-side"`, or `"side-by-side-show-both"`. All support per-chunk and line-range staging. |
 | `difftastic-status-line-numbers`         | `t`          | Whether difft's per-line number gutters are shown. When `nil` they are hidden; staging works the same either way. |
 | `difftastic-status-width`                | `window`     | Column width passed to difft, controlling where it wraps long lines: `window` (fit the window) or an integer (fixed columns; larger wraps less). |
 | `difftastic-status-min-width`            | `40`         | Minimum column width requested from difft. |

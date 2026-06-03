@@ -136,7 +136,7 @@
   :group 'magit
   :prefix "difftastic-status-")
 
-(defcustom difftastic-status-display "inline"
+(defcustom difftastic-status-display "side-by-side"
   "Difft layout used to render chunks (passed to difft's `--display').
 All three layouts support per-chunk and line-range (region) staging:
 
