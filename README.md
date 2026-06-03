@@ -159,7 +159,7 @@ step is skipped entirely — no hard dependency, nothing assumed.
 | Variable                                 | Default      | Description                                                                 |
 |------------------------------------------|--------------|-----------------------------------------------------------------------------|
 | `difftastic-status-display`              | `"inline"`   | Value passed to `difft --display`. `inline` is strongly recommended; line-range staging relies on its one-row-per-line layout. |
-| `difftastic-status-chunk-heading-face`   | `magit-hash` | Face for the per-chunk `@@ line N @@` headings.                             |
+| `difftastic-status-chunk-heading-face`   | `magit-diff-hunk-heading` | Face for the per-chunk `@@ line N @@` headings. Defaults to Magit's hunk-heading face (a full-width bar); set to e.g. `magit-hash` for understated headings. |
 | `difftastic-status-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
 | `difftastic-status-diff-buffers`         | `t`          | Render `magit-diff-mode` buffers (including the commit-message preview) with difftastic chunks. |
 | `difftastic-status-revision-buffers`     | `t`          | Render `magit-revision-mode` buffers (viewing a commit) with difftastic chunks. |

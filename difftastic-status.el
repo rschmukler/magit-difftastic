@@ -145,13 +145,13 @@ layout makes per-line mapping ambiguous."
   :type 'string
   :group 'difftastic-status)
 
-(defcustom difftastic-status-chunk-heading-face 'magit-hash
+(defcustom difftastic-status-chunk-heading-face 'magit-diff-hunk-heading
   "Face used for the per-chunk `@@ line N @@' headings.
-Defaults to `magit-hash' (the muted face Magit uses for commit hashes), to
-keep the headings understated.  Set to any face you prefer, e.g.
-`magit-section-heading' for a bolder look, `font-lock-comment-face' for
-something comment-like, or `magit-diff-hunk-heading' for Magit's default
-hunk-heading look."
+Defaults to `magit-diff-hunk-heading', so the headings look like Magit's own
+hunk headings (a full-width bar, since that face has `:extend t').  Set to any
+face you prefer, e.g. `magit-hash' (the muted face Magit uses for commit hashes)
+for understated headings, `magit-section-heading' for a bolder look, or
+`font-lock-comment-face' for something comment-like."
   :type 'face
   :group 'difftastic-status)
 
@@ -233,14 +233,19 @@ appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
        (seq-find (lambda (c) (eq (oref c type) 'difftastic-hunk))
                  (oref file-section children))))
 
-(defun difftastic-status-visit-file-dwim ()
+(defun difftastic-status-visit-file-dwim (&optional display)
   "Visit the file enclosing point, jumping to the chunk's exact change.
 When on a chunk, jump to the line and column of its first new-side change
 \(via `difft --display json'); falls back to the chunk's stored gutter line.
 On a file heading (not a chunk), behaves as if point were on the file's first
-chunk.  We avoid `magit-diff-visit-file' here because it expects the current
-section to be a real Magit diff/hunk section (with slots like `from-range'),
-which our custom `difftastic-hunk' sections do not have."
+chunk.  DISPLAY, when `other-window' or `other-frame', visits the file in
+another window or frame (mirroring Magit's `*-other-window'/`*-other-frame'
+visit commands); otherwise the file is visited in the selected window.
+
+We avoid Magit's own `magit-diff-visit-*' commands here because they expect the
+current section to be a real Magit diff/hunk section (with slots like
+`from-range'), which our custom `difftastic-hunk' (and difftastic `file')
+sections do not have -- calling them signals an `invalid slot' error."
   (interactive)
   (if-let* ((file-section (difftastic-status--enclosing-file-section)))
       (let* ((file (oref file-section value))
@@ -253,7 +258,11 @@ which our custom `difftastic-hunk' sections do not have."
                                    (plist-get val :diff-args)
                                    (plist-get val :index))))
                        (and val (plist-get val :line)))))
-        (find-file (expand-file-name file (magit-toplevel)))
+        (funcall (pcase display
+                   ('other-window #'find-file-other-window)
+                   ('other-frame  #'find-file-other-frame)
+                   (_             #'find-file))
+                 (expand-file-name file (magit-toplevel)))
         (when line
           (goto-char (point-min))
           (forward-line (1- line))
@@ -635,20 +644,33 @@ worktree to apply a patch to."
       (difftastic-status--discard-chunk-1 section)
     (apply orig args)))
 
-(defun difftastic-status--visit-advice (orig &rest args)
-  "Around-advice for `magit-visit-thing'/`magit-diff-visit-file' (see commentary).
-Handle both a difftastic chunk and a difftastic `file' section (one with
-`difftastic-hunk' children): visiting either with the real command expects hunk
-slots our sections lack and would signal an `invalid slot' error.
+(defun difftastic-status--on-difftastic-section-p ()
+  "Non-nil when point is on a difftastic chunk or difftastic `file' section."
+  (or (difftastic-status--current-chunk)
+      (difftastic-status--first-chunk
+       (difftastic-status--enclosing-file-section))))
 
-We must advise BOTH commands: on a chunk, `RET' resolves to `magit-visit-thing'
-\(our `magit-difftastic-hunk-section-map' adds no remap), but on a `file'
-heading Magit's `magit-diff-section-map' remaps `magit-visit-thing' to
-`magit-diff-visit-file', so advising only the former never fires there."
-  (if (or (difftastic-status--current-chunk)
-          (difftastic-status--first-chunk
-           (difftastic-status--enclosing-file-section)))
+(defun difftastic-status--visit-advice (orig &rest args)
+  "Around-advice for the same-window Magit visit commands (see commentary).
+On a difftastic chunk or `file' section, visit via
+`difftastic-status-visit-file-dwim'; otherwise call ORIG with ARGS.  Magit's own
+visit commands expect a real diff/hunk section (with slots like `from-range')
+that our custom sections lack, so calling them would signal an `invalid slot'
+error."
+  (if (difftastic-status--on-difftastic-section-p)
       (difftastic-status-visit-file-dwim)
+    (apply orig args)))
+
+(defun difftastic-status--visit-other-window-advice (orig &rest args)
+  "Like `difftastic-status--visit-advice', but visiting in another window."
+  (if (difftastic-status--on-difftastic-section-p)
+      (difftastic-status-visit-file-dwim 'other-window)
+    (apply orig args)))
+
+(defun difftastic-status--visit-other-frame-advice (orig &rest args)
+  "Like `difftastic-status--visit-advice', but visiting in another frame."
+  (if (difftastic-status--on-difftastic-section-p)
+      (difftastic-status-visit-file-dwim 'other-frame)
     (apply orig args)))
 
 (defconst difftastic-status--advices
@@ -658,16 +680,25 @@ heading Magit's `magit-diff-section-map' remaps `magit-visit-thing' to
   ;; interactive forms prompt for files, which would pop a prompt even when we
   ;; just want to stage the chunk.  Instead the `s'/`u'/`x' keys are bound
   ;; explicitly per evil state (see `difftastic-status--set-evil-keys').
+  ;;
+  ;; The whole `magit-diff-visit-*' family is intercepted: depending on the
+  ;; keybinding setup, `RET'/`C-j' on a file heading or chunk can resolve to any
+  ;; of these (e.g. evil-collection binds `RET' to `magit-diff-visit-worktree-file'
+  ;; and vanilla Magit binds `C-j'/`C-<return>' to it), and each would read hunk
+  ;; slots our sections lack.  Commands that may be absent on older Magit are
+  ;; guarded by `fboundp' where they are advised (see `difftastic-status-mode').
   '((magit-stage        . difftastic-status--stage-advice)
     (magit-unstage      . difftastic-status--unstage-advice)
     (magit-discard      . difftastic-status--discard-advice)
     (magit-delete-thing . difftastic-status--discard-advice)
     (magit-visit-thing  . difftastic-status--visit-advice)
-    ;; On a `file' heading, Magit's `magit-diff-section-map' remaps
-    ;; `magit-visit-thing' to `magit-diff-visit-file', so `RET' there bypasses
-    ;; the `magit-visit-thing' advice; intercept `magit-diff-visit-file' too.
-    (magit-diff-visit-file . difftastic-status--visit-advice))
-  "Alist of (MAGIT-COMMAND . ADVICE) intercepted while on a difftastic chunk.")
+    (magit-diff-visit-file                       . difftastic-status--visit-advice)
+    (magit-diff-visit-worktree-file              . difftastic-status--visit-advice)
+    (magit-diff-visit-file-other-window          . difftastic-status--visit-other-window-advice)
+    (magit-diff-visit-worktree-file-other-window . difftastic-status--visit-other-window-advice)
+    (magit-diff-visit-file-other-frame           . difftastic-status--visit-other-frame-advice)
+    (magit-diff-visit-worktree-file-other-frame  . difftastic-status--visit-other-frame-advice))
+  "Alist of (MAGIT-COMMAND . ADVICE) intercepted while on a difftastic section.")
 
 (defun difftastic-status--chunk-start-line (body-lines)
   "Return the first line number appearing in BODY-LINES, as a string, or nil.
@@ -695,14 +726,30 @@ can rebuild the corresponding git hunk."
   (when body-lines
     (let* ((start (difftastic-status--chunk-start-line body-lines))
            (heading (if start (format "@@ line %s @@" start) "@@ @@")))
-      (magit-insert-section (difftastic-hunk
-                             (list :file file :index index
-                                   :diff-args (plist-get context :diff-args)
-                                   :staged (plist-get context :staged)
-                                   :stageable (plist-get context :stageable)
-                                   :line (and start (string-to-number start))))
+      (magit-insert-section section
+          (difftastic-hunk
+           (list :file file :index index
+                 :diff-args (plist-get context :diff-args)
+                 :staged (plist-get context :staged)
+                 :stageable (plist-get context :stageable)
+                 :line (and start (string-to-number start)))
+           nil
+           ;; Match Magit's hunk highlighting: when point is on the chunk, its
+           ;; heading gets `magit-diff-hunk-heading-highlight' (and the selection
+           ;; face for multi-chunk regions), exactly like a `magit-hunk-section'.
+           :heading-highlight-face 'magit-diff-hunk-heading-highlight
+           :heading-selection-face 'magit-diff-hunk-heading-selection)
+        ;; Set the section keymap here rather than via `magit-insert-section':
+        ;; the base `magit-section' `keymap' slot has no initarg, so passing
+        ;; `:keymap' would signal `invalid-slot-name'.  It is applied later in
+        ;; `magit-insert-section--finish', after this body runs.
+        (oset section keymap 'difftastic-status-hunk-section-map)
         (magit-insert-heading
-          (propertize heading 'font-lock-face difftastic-status-chunk-heading-face))
+          ;; Include the newline in the faced string (as Magit does for its own
+          ;; hunk headings) so a face with `:extend t' -- e.g. the default
+          ;; `magit-diff-hunk-heading' -- fills the heading bar to the window edge.
+          (propertize (concat heading "\n")
+                      'font-lock-face difftastic-status-chunk-heading-face))
         (dolist (l body-lines)
           (insert l "\n"))))))
 
@@ -728,23 +775,49 @@ CONTEXT is the diff context plist threaded down to each chunk section."
     (when started
       (difftastic-status--insert-chunk (nreverse chunk) file index context))))
 
-(defun difftastic-status--deleted-files (diff-args)
-  "Return the list of paths the DIFF-ARGS diff reports as deleted.
+(defun difftastic-status--file-statuses (diff-args)
+  "Return an alist of (PATH . (STATUS . ORIG)) for the DIFF-ARGS diff.
 DIFF-ARGS is the leading git invocation (see
-`difftastic-status--file-diff-string'); `--name-status' is appended so deletions
-can be detected without rendering a diff.  Used to mirror Magit, which collapses
-deleted-file sections by default."
+`difftastic-status--file-diff-string'); `--name-status' is appended so each
+file's status can be read without rendering a diff.  STATUS is Magit's own
+status word (\"modified\", \"new file\", \"deleted\" or \"renamed\") and ORIG is
+the source path for a rename (else nil).  Used so our difftastic file headings
+mimic Magit's exactly, and to collapse deleted-file sections like Magit does."
   (with-temp-buffer
     (apply #'process-file "git" nil t nil
            (append diff-args '("--name-status")))
-    (let (deleted)
+    (let (statuses)
       (dolist (line (split-string (buffer-string) "\n" t))
-        (let ((fields (split-string line "\t")))
-          ;; Status lines are "<STATUS>\t<PATH>" (and "R.../C..." carry an extra
-          ;; field); a leading `D' marks a deletion, whose path is the next field.
-          (when (and (string-prefix-p "D" (car fields)) (cadr fields))
-            (push (cadr fields) deleted))))
-      deleted)))
+        ;; A status line is "<CODE>\t<PATH>", except rename/copy which is
+        ;; "<CODE>\t<OLD>\t<NEW>"; CODE's first letter is the change kind.
+        (let* ((fields (split-string line "\t"))
+               (code (car fields)))
+          (when (and code (> (length code) 0) (cadr fields))
+            (pcase (aref code 0)
+              (?A (push (cons (cadr fields) (cons "new file" nil)) statuses))
+              (?D (push (cons (cadr fields) (cons "deleted" nil)) statuses))
+              ;; Magit shows copies as "new file"; renames as "renamed".
+              (?C (when (nth 2 fields)
+                    (push (cons (nth 2 fields) (cons "new file" (cadr fields)))
+                          statuses)))
+              (?R (when (nth 2 fields)
+                    (push (cons (nth 2 fields) (cons "renamed" (cadr fields)))
+                          statuses)))
+              (_  (push (cons (cadr fields) (cons "modified" nil)) statuses))))))
+      statuses)))
+
+(defun difftastic-status--file-heading (file status orig)
+  "Return the heading string for FILE, mimicking Magit's `file' section heading.
+STATUS is Magit's status word and ORIG the rename source (or nil); see
+`difftastic-status--file-statuses'.  Uses `magit-format-file' (so any
+icon/format customization applies) with the `magit-diff-file-heading' face, and
+falls back to a `magit-format-file-default'-style string on older Magit."
+  (let ((orig (and orig (not (equal orig file)) orig)))
+    (if (fboundp 'magit-format-file)
+        (magit-format-file 'diff file 'magit-diff-file-heading status orig)
+      (propertize (concat (and status (format "%-11s" status))
+                          (if orig (format "%s -> %s" orig file) file))
+                  'font-lock-face 'magit-diff-file-heading))))
 
 (defvar-local difftastic-status--stock-files nil
   "List of repo-relative paths to render with stock Magit, not difftastic.
@@ -762,22 +835,34 @@ staging and visibility apply unchanged.  Falls back to difftastic rendering if
 `magit--insert-diff' is unavailable."
   (if (and (fboundp 'magit--insert-diff)
            (plist-get context :stock-args))
-      (magit--insert-diff t (plist-get context :stock-args) "--" file)
+      (progn
+        (magit--insert-diff t (plist-get context :stock-args) "--" file)
+        ;; `magit-diff-wash-diffs' appends a trailing blank line after the file
+        ;; section (in stock Magit that is the single separator after the whole
+        ;; diff block).  We insert one file at a time, so drop it to keep stock
+        ;; files contiguous like the difftastic ones; the surrounding inserter
+        ;; adds the one separator after the group.
+        (when (and (eq (char-before) ?\n)
+                   (eq (char-before (1- (point))) ?\n))
+          (delete-char -1)))
     (difftastic-status--insert-difftastic-file
      file context
-     (difftastic-status--deleted-files (plist-get context :diff-args)))))
+     (difftastic-status--file-statuses (plist-get context :diff-args)))))
 
-(defun difftastic-status--insert-difftastic-file (file context deleted)
+(defun difftastic-status--insert-difftastic-file (file context statuses)
   "Insert the difftastic `file' section for FILE using CONTEXT.
-DELETED is the list of paths this diff reports as deleted (see
-`difftastic-status--deleted-files'), used for Magit-matching initial
-visibility.  This is the default rendering; see
-`difftastic-status--insert-file-sections'."
-  (let ((diff-args (plist-get context :diff-args)))
-    (magit-insert-section (file file (or (and (member file deleted) t)
+STATUSES is the (PATH . (STATUS . ORIG)) alist for this diff (see
+`difftastic-status--file-statuses'); it drives the Magit-matching file heading
+and the Magit-matching initial visibility (deleted files start collapsed).  This
+is the default rendering; see `difftastic-status--insert-file-sections'."
+  (let* ((diff-args (plist-get context :diff-args))
+         (info (cdr (assoc file statuses)))
+         (status (or (car info) "modified"))
+         (orig (cdr info)))
+    (magit-insert-section (file file (or (equal status "deleted")
                                          (derived-mode-p 'magit-status-mode)))
       (magit-insert-heading
-        (propertize file 'font-lock-face 'magit-filename))
+        (difftastic-status--file-heading file status orig))
       (difftastic-status--insert-chunks
        (difftastic-status--file-diff-string file diff-args)
        file context))))
@@ -806,17 +891,17 @@ Initial visibility mirrors Magit: a file section starts collapsed in
 the diff/revision buffers.  The chunk sections are always inserted expanded, so
 expanding a file reveals its hunk(s) -- the same way a single-hunk file feels
 like it expands straight to its diff in Magit."
-  ;; Compute deletions once for the whole group (only the difftastic path needs
-  ;; them, for Magit-matching initial visibility).
-  (let ((deleted (and (cl-some (lambda (f)
-                                 (not (member f difftastic-status--stock-files)))
-                               files)
-                      (difftastic-status--deleted-files
-                       (plist-get context :diff-args)))))
+  ;; Read each file's status once for the whole group (only the difftastic path
+  ;; needs it: for the Magit-matching heading and initial visibility).
+  (let ((statuses (and (cl-some (lambda (f)
+                                  (not (member f difftastic-status--stock-files)))
+                                files)
+                       (difftastic-status--file-statuses
+                        (plist-get context :diff-args)))))
     (dolist (file files)
       (if (member file difftastic-status--stock-files)
           (difftastic-status--insert-stock-file file context)
-        (difftastic-status--insert-difftastic-file file context deleted)))))
+        (difftastic-status--insert-difftastic-file file context statuses)))))
 
 (defun difftastic-status--context-unstaged ()
   "Diff context plist for the worktree-vs-index (unstaged) diff."
@@ -995,40 +1080,45 @@ sections are inserted directly (no extra wrapping section)."
 
 (defcustom difftastic-status-toggle-rendering-key "C-c C-d"
   "Key bound on difftastic-status sections to toggle a file's rendering.
-A `key-valid-p' string bound to `difftastic-status-toggle-file-rendering' while
-`difftastic-status-mode' is enabled, so the file at point can be switched
-between difftastic and stock Magit rendering (and back).  Set to nil to bind no
-key.  Changing this takes effect the next time the mode is toggled."
+A key sequence in `kbd' syntax, bound to
+`difftastic-status-toggle-file-rendering' while `difftastic-status-mode' is
+enabled, so the file at point can be switched between difftastic and stock Magit
+rendering (and back).  Set to nil to bind no key.  Changing this takes effect
+the next time the mode is toggled."
   :type '(choice (const :tag "No binding" nil)
                  (string :tag "Key"))
   :group 'difftastic-status)
 
-(defvar-keymap magit-difftastic-hunk-section-map
-  :doc "Keymap for difftastic chunk (`difftastic-hunk') sections.
-Magit installs this on each difftastic chunk section, resolved from the section
-type.  `difftastic-status-mode' adds `difftastic-status-toggle-rendering-key'
-here while enabled; unbound keys fall through to the Magit maps as usual.")
+(defvar difftastic-status-hunk-section-map
+  (make-sparse-keymap)
+  "Keymap installed on difftastic chunk (`difftastic-hunk') sections.
+Attached via each section's `:keymap' slot (see
+`difftastic-status--insert-chunk').  `difftastic-status-mode' adds
+`difftastic-status-toggle-rendering-key' here while enabled; unbound keys fall
+through to the Magit maps as usual.")
 
 (defun difftastic-status--set-toggle-key (enable)
   "Bind (ENABLE non-nil) or unbind the file-rendering toggle key.
 The key is `difftastic-status-toggle-rendering-key' and the command is
 `difftastic-status-toggle-file-rendering'.  We bind it in
-`magit-difftastic-hunk-section-map' (difftastic chunks) and in Magit's shared
+`difftastic-status-hunk-section-map' (difftastic chunks) and in Magit's shared
 `magit-file-section-map'/`magit-hunk-section-map', so the toggle is reachable
 both on difftastic sections and on the stock `file'/`hunk' sections a
 toggled-to-stock file produces (difftastic file headings also use
 `magit-file-section-map').  The key lives only on these section keymaps, so no
 global Magit binding is shadowed."
   (when-let* ((key difftastic-status-toggle-rendering-key)
-              ((key-valid-p key)))
-    (dolist (map '(magit-difftastic-hunk-section-map
+              ((stringp key))
+              (seq (ignore-errors (kbd key))))
+    (dolist (map '(difftastic-status-hunk-section-map
                    magit-file-section-map
                    magit-hunk-section-map))
       (when (boundp map)
-        (if enable
-            (keymap-set (symbol-value map) key
-                        #'difftastic-status-toggle-file-rendering)
-          (keymap-unset (symbol-value map) key t))))))
+        ;; Use `define-key'/`kbd' (not `keymap-set'/`keymap-unset') to keep the
+        ;; Emacs 28.1 minimum; a nil definition removes our binding (the key is
+        ;; not otherwise bound in these maps, so this leaves them as before).
+        (define-key (symbol-value map) seq
+                    (and enable #'difftastic-status-toggle-file-rendering))))))
 
 (defconst difftastic-status--evil-keys
   '(("s" . difftastic-status-stage-chunk)
@@ -1076,10 +1166,10 @@ staging is offered only where it is meaningful (the worktree and `--cached'
 diffs).  Evil visual-state keys are also bound so region (line-range) staging
 works.
 
-`difftastic-status-toggle-rendering-key' (default \\`C-c C-d') is bound on the
-difftastic and stock sections to `difftastic-status-toggle-file-rendering',
-which switches the file at point between difftastic and stock Magit rendering
-\(a stock-rendered file uses Magit's native per-hunk/line staging)."
+`difftastic-status-toggle-rendering-key' is bound on the difftastic and stock
+sections to `difftastic-status-toggle-file-rendering', which switches the file
+at point between difftastic and stock Magit rendering (a stock-rendered file
+uses Magit's native per-hunk/line staging)."
   :global t
   :group 'difftastic-status
   (if difftastic-status-mode
@@ -1093,7 +1183,9 @@ which switches the file at point between difftastic and stock Magit rendering
         (advice-add 'magit-insert-revision-diff :around
                     #'difftastic-status--insert-revision-diff-advice)
         (pcase-dolist (`(,cmd . ,advice) difftastic-status--advices)
-          (advice-add cmd :around advice))
+          ;; Some `magit-diff-visit-*' variants may be absent on older Magit.
+          (when (fboundp cmd)
+            (advice-add cmd :around advice)))
         (difftastic-status--set-evil-keys t)
         (difftastic-status--set-toggle-key t))
     (advice-remove 'magit-insert-unstaged-changes
@@ -1105,7 +1197,8 @@ which switches the file at point between difftastic and stock Magit rendering
     (advice-remove 'magit-insert-revision-diff
                    #'difftastic-status--insert-revision-diff-advice)
     (pcase-dolist (`(,cmd . ,advice) difftastic-status--advices)
-      (advice-remove cmd advice))
+      (when (fboundp cmd)
+        (advice-remove cmd advice)))
     (difftastic-status--set-evil-keys nil)
     (difftastic-status--set-toggle-key nil))
   ;; Refresh any visible status/diff/revision buffers so the change is
