@@ -628,10 +628,15 @@ worktree to apply a patch to."
     (apply orig args)))
 
 (defun difftastic-status--visit-advice (orig &rest args)
-  "Around-advice for `magit-visit-thing' (see commentary).
+  "Around-advice for `magit-visit-thing'/`magit-diff-visit-file' (see commentary).
 Handle both a difftastic chunk and a difftastic `file' section (one with
-`difftastic-hunk' children): visiting a real `magit-visit-thing' on the latter
-expects hunk slots our sections lack and would signal an `invalid slot' error."
+`difftastic-hunk' children): visiting either with the real command expects hunk
+slots our sections lack and would signal an `invalid slot' error.
+
+We must advise BOTH commands: on a chunk, `RET' resolves to `magit-visit-thing'
+\(our `magit-difftastic-hunk-section-map' adds no remap), but on a `file'
+heading Magit's `magit-diff-section-map' remaps `magit-visit-thing' to
+`magit-diff-visit-file', so advising only the former never fires there."
   (if (or (difftastic-status--current-chunk)
           (difftastic-status--first-chunk
            (difftastic-status--enclosing-file-section)))
@@ -649,7 +654,11 @@ expects hunk slots our sections lack and would signal an `invalid slot' error."
     (magit-unstage      . difftastic-status--unstage-advice)
     (magit-discard      . difftastic-status--discard-advice)
     (magit-delete-thing . difftastic-status--discard-advice)
-    (magit-visit-thing  . difftastic-status--visit-advice))
+    (magit-visit-thing  . difftastic-status--visit-advice)
+    ;; On a `file' heading, Magit's `magit-diff-section-map' remaps
+    ;; `magit-visit-thing' to `magit-diff-visit-file', so `RET' there bypasses
+    ;; the `magit-visit-thing' advice; intercept `magit-diff-visit-file' too.
+    (magit-diff-visit-file . difftastic-status--visit-advice))
   "Alist of (MAGIT-COMMAND . ADVICE) intercepted while on a difftastic chunk.")
 
 (defun difftastic-status--chunk-start-line (body-lines)
