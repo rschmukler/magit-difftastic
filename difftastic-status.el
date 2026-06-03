@@ -40,6 +40,12 @@
 ;; difftastic chunk (or selected region) at point.  When the mode is off,
 ;; Magit's stock sections are used, so you can always fall back.
 ;;
+;; Section visibility mirrors Magit: a file section starts collapsed in the
+;; `magit-status' buffer (and for deleted files everywhere) and expanded in the
+;; diff/revision buffers, while the per-chunk sections always start expanded --
+;; so expanding a file reveals its hunk(s), the same way a single-hunk file
+;; feels like it expands straight to its diff in stock Magit.
+;;
 ;; The same difftastic chunks are also rendered in `magit-diff-mode' buffers --
 ;; which includes the diff Magit shows while you compose a commit message -- and
 ;; in `magit-revision-mode' buffers (viewing a commit), by advising Magit's
@@ -705,6 +711,24 @@ CONTEXT is the diff context plist threaded down to each chunk section."
     (when started
       (difftastic-status--insert-chunk (nreverse chunk) file index context))))
 
+(defun difftastic-status--deleted-files (diff-args)
+  "Return the list of paths the DIFF-ARGS diff reports as deleted.
+DIFF-ARGS is the leading git invocation (see
+`difftastic-status--file-diff-string'); `--name-status' is appended so deletions
+can be detected without rendering a diff.  Used to mirror Magit, which collapses
+deleted-file sections by default."
+  (with-temp-buffer
+    (apply #'process-file "git" nil t nil
+           (append diff-args '("--name-status")))
+    (let (deleted)
+      (dolist (line (split-string (buffer-string) "\n" t))
+        (let ((fields (split-string line "\t")))
+          ;; Status lines are "<STATUS>\t<PATH>" (and "R.../C..." carry an extra
+          ;; field); a leading `D' marks a deletion, whose path is the next field.
+          (when (and (string-prefix-p "D" (car fields)) (cadr fields))
+            (push (cadr fields) deleted))))
+      deleted)))
+
 (defun difftastic-status--insert-file-sections (files context)
   "Insert a collapsible difftastic `file' section for each of FILES.
 Files are contiguous (no blank line between them); the only blank line is
@@ -715,10 +739,19 @@ CONTEXT is a diff context plist with the entries:
   :staged     non-nil when the diff is the index against HEAD;
   :stageable  non-nil when per-chunk staging is meaningful in this buffer.
 It is threaded down to every chunk section so the staging commands can rebuild
-the corresponding git hunk."
-  (let ((diff-args (plist-get context :diff-args)))
+the corresponding git hunk.
+
+Initial visibility mirrors Magit: a file section starts collapsed in
+`magit-status-mode' buffers (and for deleted files everywhere), and expanded in
+the diff/revision buffers.  The chunk sections are always inserted expanded, so
+expanding a file reveals its hunk(s) -- the same way a single-hunk file feels
+like it expands straight to its diff in Magit."
+  (let ((diff-args (plist-get context :diff-args))
+        (deleted (difftastic-status--deleted-files (plist-get context :diff-args)))
+        (status-buffer (derived-mode-p 'magit-status-mode)))
     (dolist (file files)
-      (magit-insert-section (file file)
+      (magit-insert-section (file file (or (and (member file deleted) t)
+                                           status-buffer))
         (magit-insert-heading
           (propertize file 'font-lock-face 'magit-filename))
         (difftastic-status--insert-chunks
