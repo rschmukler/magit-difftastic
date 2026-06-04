@@ -111,11 +111,14 @@
 ;;     point); a region spanning multiple chunks/files only affects the chunk
 ;;     that contains it.  Whole-chunk staging snaps to the underlying git hunk
 ;;     boundary -- the same boundary Magit's own per-hunk staging uses.
-;;   - `difft' is run once per changed file on every status refresh.  The files
-;;     in a section are rendered concurrently (up to `magit-difftastic-render-jobs'
-;;     processes at a time), so a refresh costs roughly its slowest file rather
-;;     than the sum of all of them, but a very large change set can still make
-;;     `magit-status' sluggish since the refresh waits for the whole batch.
+;;   - `difft' is run once per changed file when its content first needs
+;;     rendering.  Files in a section are rendered concurrently (up to
+;;     `magit-difftastic-render-jobs' processes at a time) and the result is
+;;     cached across refreshes keyed on the compared blobs (see
+;;     `magit-difftastic-cache'), so an unchanged file is not re-rendered -- a
+;;     refresh costs roughly the slowest file that actually changed.  A very
+;;     large set of first-time changes can still make `magit-status' sluggish,
+;;     since the refresh waits for that initial batch.
 ;;   - Untracked files are still rendered by the stock
 ;;     `magit-insert-untracked-files'.
 ;;   - In `magit-diff-mode'/`magit-revision-mode' buffers the difftastic
@@ -336,6 +339,120 @@ a synchronous render."
       (while (> pending 0)
         (accept-process-output nil 0.05)))
     results))
+
+;;; Render cache
+;;
+;; difft output for a file is a pure function of the two blobs being compared
+;; plus the display layout and width, so we cache rendered strings across
+;; refreshes keyed on exactly those inputs.  The blobs are identified by their
+;; git object ids (read once per group with a single plumbing `--raw' call); a
+;; worktree side git has not hashed (reported as an all-zero id) is keyed by the
+;; file's stat (size + mtime) instead.  After a staging action only the touched
+;; file's blob id changes, so every other file is served from the cache and not
+;; re-rendered.
+
+(defun magit-difftastic--raw-args (diff-args)
+  "Return the plumbing `--raw' form of DIFF-ARGS (difft disabled).
+Swaps `--ext-diff' for `--no-ext-diff' and appends `--raw'/`--no-abbrev', so the
+same subcommand and selector that renders a diff instead reports each file's
+full old/new blob object ids cheaply."
+  (append (mapcar (lambda (a) (if (equal a "--ext-diff") "--no-ext-diff" a))
+                  diff-args)
+          '("--raw" "--no-abbrev")))
+
+(defun magit-difftastic--blob-ids (diff-args files)
+  "Return a hash of FILE -> (OLD-ID . NEW-ID) for the DIFF-ARGS diff of FILES.
+Runs a single `git ... --raw' plumbing call (see `magit-difftastic--raw-args').
+A worktree side git has not hashed is reported as an all-zero NEW-ID; callers
+fold the worktree file's stat into the cache key for those.  A rename's entry is
+keyed on the NEW path (matching how files are rendered)."
+  (let ((map (make-hash-table :test 'equal)))
+    (when files
+      (with-temp-buffer
+        (apply #'process-file "git" nil t nil
+               (append (magit-difftastic--raw-args diff-args) '("--") files))
+        (dolist (line (split-string (buffer-string) "\n" t))
+          ;; A raw line is ":OMODE NMODE OID NID STATUS\tPATH" (rename/copy:
+          ;; "...\tOLD\tNEW").  Combined (merge) diffs start with "::" and are
+          ;; not rendered by us, so they are ignored here.
+          (when (and (string-prefix-p ":" line)
+                     (not (string-prefix-p "::" line)))
+            (when-let* ((tab (string-search "\t" line))
+                        (meta (split-string (substring line 0 tab) " " t))
+                        (paths (split-string (substring line (1+ tab)) "\t"))
+                        (oid (nth 2 meta))
+                        (nid (nth 3 meta))
+                        (path (car (last paths))))
+              (puthash path (cons oid nid) map))))))
+    map))
+
+(defcustom magit-difftastic-cache t
+  "Whether to cache rendered difft output across refreshes.
+When non-nil, each file's difft output is cached keyed on the two blobs being
+compared plus the display layout and width, so a refresh that does not change a
+file's content reuses the previous rendering instead of running difft again.
+Clear it manually with `magit-difftastic-clear-cache'."
+  :type 'boolean
+  :group 'magit-difftastic)
+
+(defconst magit-difftastic--cache-max 2048
+  "Maximum number of entries kept in `magit-difftastic--cache'.
+When exceeded the cache is cleared wholesale; entries are keyed on immutable
+blob ids (or a worktree stat), so this only bounds memory -- a kept entry is
+never stale.")
+
+(defvar magit-difftastic--cache (make-hash-table :test 'equal)
+  "Persistent cache of rendered difft output, surviving across refreshes.
+Maps a content-identity key (see `magit-difftastic--cache-key') to the
+propertized difft string.  Bounded by `magit-difftastic--cache-max'.")
+
+(defun magit-difftastic-clear-cache ()
+  "Empty the difftastic render cache (`magit-difftastic--cache')."
+  (interactive)
+  (clrhash magit-difftastic--cache)
+  (when (called-interactively-p 'interactive)
+    (message "magit-difftastic render cache cleared")))
+
+(defun magit-difftastic--all-zero-id-p (id)
+  "Return non-nil when git object id ID is the all-zero placeholder."
+  (and (stringp id) (string-match-p "\\`0+\\'" id)))
+
+(defun magit-difftastic--worktree-stat (file)
+  "Return (SIZE . MTIME) for FILE in the worktree, or nil if unavailable."
+  (when-let* ((attrs (ignore-errors
+                       (file-attributes
+                        (expand-file-name file (magit-toplevel))))))
+    (cons (file-attribute-size attrs)
+          (file-attribute-modification-time attrs))))
+
+(defun magit-difftastic--cache-key (file ids width)
+  "Return the render-cache key for FILE, or nil when it cannot be keyed.
+IDS is the (OLD-ID . NEW-ID) pair from `magit-difftastic--blob-ids' and WIDTH is
+the column width.  A worktree NEW side (an all-zero id git has not hashed) is
+keyed by the file's stat so edits invalidate the entry; when neither the new id
+nor the stat is available the file cannot be safely cached (returns nil), so it
+is always re-rendered."
+  (when ids
+    (let* ((old (car ids))
+           (new (cdr ids))
+           (new-key (if (magit-difftastic--all-zero-id-p new)
+                        (when-let* ((st (magit-difftastic--worktree-stat file)))
+                          (cons 'stat st))
+                      new)))
+      (and old new-key
+           (list magit-difftastic-display width old new-key)))))
+
+(defun magit-difftastic--cache-get (key)
+  "Return the cached render for KEY, or nil (also nil when KEY or caching is off)."
+  (and key magit-difftastic-cache (gethash key magit-difftastic--cache)))
+
+(defun magit-difftastic--cache-put (key value)
+  "Store VALUE under KEY in the render cache when caching is enabled."
+  (when (and key value magit-difftastic-cache)
+    (when (> (hash-table-count magit-difftastic--cache)
+             magit-difftastic--cache-max)
+      (clrhash magit-difftastic--cache))
+    (puthash key value magit-difftastic--cache)))
 
 ;;; Per-chunk staging
 ;;
@@ -1392,6 +1509,40 @@ is the default rendering; see `magit-difftastic--insert-file-sections'."
        (magit-difftastic--file-diff-string file diff-args)
        file context))))
 
+(defun magit-difftastic--prewarm (render-files context width)
+  "Return a FILE -> rendered-string hash for RENDER-FILES of CONTEXT at WIDTH.
+Files whose content is unchanged since an earlier refresh are served from the
+persistent cache (`magit-difftastic--cache'); the remaining files are rendered
+concurrently (`magit-difftastic--render-files') and then stored in that cache.
+Files that cannot be content-keyed (or when `magit-difftastic-cache' is nil) are
+simply rendered every time."
+  (let* ((diff-args (plist-get context :diff-args))
+         (result (make-hash-table :test 'equal))
+         ;; One plumbing call resolves every file's old/new blob ids for keys.
+         (ids (and magit-difftastic-cache
+                   (ignore-errors
+                     (magit-difftastic--blob-ids diff-args render-files))))
+         (keys (make-hash-table :test 'equal))
+         (misses nil))
+    (dolist (file render-files)
+      (let* ((key (and ids (magit-difftastic--cache-key
+                            file (gethash file ids) width)))
+             (hit (magit-difftastic--cache-get key)))
+        (when key (puthash file key keys))
+        (if hit
+            (puthash file hit result)
+          (push file misses))))
+    (when misses
+      (let ((rendered (magit-difftastic--render-files
+                       (mapcar (lambda (f) (cons f diff-args)) (nreverse misses))
+                       width)))
+        (maphash (lambda (file str)
+                   (puthash file str result)
+                   ;; Cache under the key computed above (nil keys are no-ops).
+                   (magit-difftastic--cache-put (gethash file keys) str))
+                 rendered)))
+    result))
+
 (defun magit-difftastic--insert-file-sections (files context)
   "Insert a collapsible difftastic `file' section for each of FILES.
 Files are contiguous (no blank line between them); the only blank line is
@@ -1439,13 +1590,13 @@ like it expands straight to its diff in Magit."
                                               (cddr s)))
                                        statuses)))
          (magit-difftastic--syntax-cache (make-hash-table :test 'equal))
-         ;; Pre-warm: render every difftastic-rendered file in this group in
-         ;; parallel up front (stock-rendered files and rename sources are
-         ;; skipped -- the former go through `magit--insert-diff', the latter
-         ;; are not shown).  The synchronous insertion loop below then reads
-         ;; each file's already-computed difft output from this cache via
-         ;; `magit-difftastic--file-diff-string', turning N serial subprocess
-         ;; spawns per refresh into one parallel batch.
+         ;; Pre-warm: resolve every difftastic-rendered file in this group up
+         ;; front (stock-rendered files and rename sources are skipped -- the
+         ;; former go through `magit--insert-diff', the latter are not shown).
+         ;; Unchanged files are served from the cross-refresh cache and the rest
+         ;; rendered in one parallel batch; the synchronous insertion loop below
+         ;; then reads each file's output from this hash via
+         ;; `magit-difftastic--file-diff-string'.
          (magit-difftastic--render-cache
           (let ((render-files
                  (cl-remove-if
@@ -1453,10 +1604,8 @@ like it expands straight to its diff in Magit."
                                   (member f rename-origins)))
                   files)))
             (when render-files
-              (magit-difftastic--render-files
-               (mapcar (lambda (f) (cons f (plist-get context :diff-args)))
-                       render-files)
-               (magit-difftastic--width))))))
+              (magit-difftastic--prewarm
+               render-files context (magit-difftastic--width))))))
     (dolist (file files)
       (unless (member file rename-origins)
         (if (member file magit-difftastic--stock-files)

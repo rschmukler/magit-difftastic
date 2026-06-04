@@ -486,6 +486,109 @@ and every requested file must be present in the returned hash."
                        (magit-difftastic--render-raw
                         f magit-difftastic--diff-base width)))))))
 
+;;;; Unit tests: render cache ----------------------------------------------
+
+(ert-deftest magit-difftastic--cache-key/direct-and-nil ()
+  "A real new blob id is embedded directly; nil ids yield no key."
+  (let ((magit-difftastic-display "inline"))
+    (should (equal (magit-difftastic--cache-key "x" '("aaa" . "bbb") 80)
+                   '("inline" 80 "aaa" "bbb"))))
+  (should-not (magit-difftastic--cache-key "x" nil 80)))
+
+(ert-deftest magit-difftastic--all-zero-id-p/detects-placeholder ()
+  (should (magit-difftastic--all-zero-id-p "0000000000000000000000000000000000000000"))
+  (should-not (magit-difftastic--all-zero-id-p "0000abc"))
+  (should-not (magit-difftastic--all-zero-id-p nil)))
+
+(ert-deftest magit-difftastic--cache-get-put/roundtrip-and-toggle ()
+  "Get/put round-trip; caching off and nil keys are no-ops."
+  (let ((magit-difftastic--cache (make-hash-table :test 'equal))
+        (magit-difftastic-cache t))
+    (should-not (magit-difftastic--cache-get '(:k)))
+    (magit-difftastic--cache-put '(:k) "rendered")
+    (should (equal (magit-difftastic--cache-get '(:k)) "rendered"))
+    ;; A nil key never stores or retrieves.
+    (magit-difftastic--cache-put nil "y")
+    (should-not (magit-difftastic--cache-get nil))
+    ;; With caching disabled, get and put are inert.
+    (let ((magit-difftastic-cache nil))
+      (should-not (magit-difftastic--cache-get '(:k)))
+      (magit-difftastic--cache-put '(:k2) "x"))
+    (should-not (gethash '(:k2) magit-difftastic--cache))))
+
+;;;; Integration: render cache ---------------------------------------------
+
+(ert-deftest magit-difftastic-integration/blob-ids ()
+  "`--blob-ids' reports a worktree new side as all-zero and staged sides as real."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("a.txt" . "alpha\n")) '(("a.txt" . "beta\n"))
+    ;; Unstaged: old = index blob (real), new = worktree (all-zero placeholder).
+    (let ((pair (gethash "a.txt"
+                         (magit-difftastic--blob-ids
+                          magit-difftastic--diff-base '("a.txt")))))
+      (should pair)
+      (should-not (magit-difftastic--all-zero-id-p (car pair)))
+      (should (magit-difftastic--all-zero-id-p (cdr pair))))
+    ;; Staged: both sides are concrete blobs.
+    (dst-test--git "add" "a.txt")
+    (let ((pair (gethash "a.txt"
+                         (magit-difftastic--blob-ids
+                          (append magit-difftastic--diff-base '("--cached"))
+                          '("a.txt")))))
+      (should pair)
+      (should-not (magit-difftastic--all-zero-id-p (car pair)))
+      (should-not (magit-difftastic--all-zero-id-p (cdr pair))))))
+
+(ert-deftest magit-difftastic-integration/cache-reuses-unchanged ()
+  "A second pre-warm with unchanged content renders nothing and matches the first."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
+                         ("b.txt" . "one\ntwo\n"))
+      '(("a.txt" . "alpha\nBRAVO\n")
+        ("b.txt" . "ONE\ntwo\n"))
+    (clrhash magit-difftastic--cache)
+    (let* ((magit-difftastic-cache t)
+           (context (magit-difftastic--context-unstaged))
+           (files '("a.txt" "b.txt"))
+           (width (magit-difftastic--width))
+           (first (magit-difftastic--prewarm files context width))
+           (rendered-again nil))
+      (should (= (hash-table-count first) 2))
+      (cl-letf (((symbol-function 'magit-difftastic--render-files)
+                 (lambda (jobs _w)
+                   (setq rendered-again jobs)
+                   (make-hash-table :test 'equal))))
+        (let ((second (magit-difftastic--prewarm files context width)))
+          ;; No misses -> the parallel renderer is never invoked.
+          (should-not rendered-again)
+          (should (= (hash-table-count second) 2))
+          (dolist (f files)
+            (should (equal (gethash f first) (gethash f second)))))))))
+
+(ert-deftest magit-difftastic-integration/cache-invalidates-on-change ()
+  "Changing one file re-renders only it; the unchanged file stays cached."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
+                         ("b.txt" . "one\ntwo\n"))
+      '(("a.txt" . "alpha\nBRAVO\n")
+        ("b.txt" . "ONE\ntwo\n"))
+    (clrhash magit-difftastic--cache)
+    (let* ((magit-difftastic-cache t)
+           (context (magit-difftastic--context-unstaged))
+           (files '("a.txt" "b.txt"))
+           (width (magit-difftastic--width)))
+      (magit-difftastic--prewarm files context width)
+      ;; Change only a.txt (different length, so its worktree stat key changes).
+      (dst-test--write "a.txt" "alpha\nBRAVO-again\n")
+      (let (rendered)
+        (cl-letf* ((orig (symbol-function 'magit-difftastic--render-files))
+                   ((symbol-function 'magit-difftastic--render-files)
+                    (lambda (jobs w)
+                      (setq rendered (mapcar #'car jobs))
+                      (funcall orig jobs w))))
+          (magit-difftastic--prewarm files context width))
+        (should (equal rendered '("a.txt")))))))
+
 ;;;; Unit tests: major-mode detection -------------------------------------
 
 (ert-deftest magit-difftastic--mode-for-file/recognizes-and-rejects ()
