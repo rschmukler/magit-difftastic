@@ -281,9 +281,9 @@ appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
                  (oref file-section children))))
 
 (defun magit-difftastic-visit-file-dwim (&optional display)
-  "Visit the file enclosing point, jumping to the chunk's exact change.
-When on a chunk, jump to the line and column of its first new-side change
-\(via `difft --display json'); falls back to the chunk's stored gutter line.
+  "Visit the file enclosing point, jumping to the chunk's first change.
+When on a chunk, jump to its first new-side line (read from the chunk's rendered
+gutters); falls back to the chunk's stored gutter line.
 On a file heading (not a chunk), behaves as if point were on the file's first
 chunk.  DISPLAY, when `other-window' or `other-frame', visits the file in
 another window or frame (mirroring Magit's `*-other-window'/`*-other-frame'
@@ -299,11 +299,8 @@ sections do not have -- calling them signals an `invalid slot' error."
              (chunk (or (magit-difftastic--current-chunk)
                         (magit-difftastic--first-chunk file-section)))
              (val (and chunk (oref chunk value)))
-             (line (or (and val (ignore-errors
-                                  (magit-difftastic--chunk-visit-line
-                                   (plist-get val :file)
-                                   (plist-get val :diff-args)
-                                   (plist-get val :index))))
+             (line (or (and chunk (ignore-errors
+                                    (magit-difftastic--chunk-visit-line chunk)))
                        (and val (plist-get val :line)))))
         (funcall (pcase display
                    ('other-window #'find-file-other-window)
@@ -376,66 +373,6 @@ and :text (the exact patch text for that hunk, including its @@ line)."
       (flush))
     (cons header (nreverse hunks))))
 
-(defun magit-difftastic--chunk-json (file diff-args index)
-  "Return difft's JSON rows (a list) for chunk INDEX of FILE, or nil.
-Each row is an alist with `lhs'/`rhs' entries.  DIFF-ARGS is the leading git
-invocation that selects the diff (see `magit-difftastic--file-diff-string')."
-  (require 'difftastic)
-  (let* ((width (magit-difftastic--width))
-         (json (with-temp-buffer
-                 (let ((process-environment
-                        (cons "DFT_UNSTABLE=yes"
-                              (difftastic--build-git-process-environment
-                               width '("--display" "json")))))
-                   (apply #'process-file "git" nil t nil
-                          (append diff-args (list "--" file))))
-                 (buffer-string)))
-         (data (ignore-errors
-                 (json-parse-string json
-                                    :object-type 'alist
-                                    :array-type 'list
-                                    :null-object nil
-                                    :false-object nil))))
-    (and data (nth index (alist-get 'chunks data)))))
-
-(defun magit-difftastic--json-chunk-lines (file diff-args index)
-  "Return (OLD-LINES . NEW-LINES), 1-indexed, for difft chunk INDEX of FILE.
-OLD-LINES/NEW-LINES are the lhs/rhs line numbers difftastic reports for the
-changed rows of that chunk.  DIFF-ARGS selects the diff (see
-`magit-difftastic--file-diff-string')."
-  (let ((chunk (magit-difftastic--chunk-json file diff-args index))
-        (old nil)
-        (new nil))
-    (dolist (row chunk)
-      (let ((lhs (alist-get 'lhs row))
-            (rhs (alist-get 'rhs row)))
-        (when (and lhs (numberp (alist-get 'line_number lhs)))
-          (push (1+ (alist-get 'line_number lhs)) old))
-        (when (and rhs (numberp (alist-get 'line_number rhs)))
-          (push (1+ (alist-get 'line_number rhs)) new))))
-    (cons (nreverse old) (nreverse new))))
-
-(defun magit-difftastic--chunk-visit-line (file diff-args index)
-  "Return the 1-based line of chunk INDEX's first change in FILE, or nil.
-Prefers the first new-side (rhs) line so visiting lands exactly on the change
-in the worktree; falls back to the first old-side (lhs) line for a pure
-deletion.  DIFF-ARGS selects the diff (see
-`magit-difftastic--file-diff-string').
-
-\(We deliberately do not try to compute a column: difft only marks changed
-tokens for recognized languages -- for plain text every span is `normal' --
-so a JSON-derived column would be misleading.  Visiting lands on the line and
-its first non-whitespace character instead.)"
-  (let ((chunk (magit-difftastic--chunk-json file diff-args index)))
-    (cl-flet ((first-line (side)
-                (cl-loop for row in chunk
-                         for s = (alist-get side row)
-                         for ln = (and s (alist-get 'line_number s))
-                         for changes = (and s (alist-get 'changes s))
-                         when (and (numberp ln) changes)
-                         return (1+ ln))))
-      (or (first-line 'rhs) (first-line 'lhs)))))
-
 (defun magit-difftastic--hunk-covers-p (hunk old-lines new-lines)
   "Return non-nil if HUNK overlaps any of OLD-LINES or NEW-LINES."
   (or (cl-some (lambda (o)
@@ -451,19 +388,72 @@ its first non-whitespace character instead.)"
                           (+ (plist-get hunk :new-beg) (plist-get hunk :new-len) -1))))
                new-lines)))
 
+(defun magit-difftastic--chunk-displayed-lines (section)
+  "Return (OLD-LINES . NEW-LINES) for every row displayed in chunk SECTION.
+OLD-LINES/NEW-LINES are the lhs/rhs file line numbers difftastic rendered in
+SECTION's own gutters, read straight from the buffer.
+
+We use these -- NOT an index into difft's `--display json' chunks -- to map a
+chunk onto git hunks, because difft's text display can merge several JSON chunks
+into one displayed section (e.g. a modification immediately followed by an
+insertion).  When that happens a section's display ordinal is no longer a valid
+index into the JSON chunk list, so indexing it picks an unrelated chunk's lines
+and stages/unstages/discards the wrong hunk (discarding one chunk would revert a
+different one).  Reading the section's own gutters always reflects exactly what
+that section shows.
+
+Uses difftastic's parser (correct for inline and either side-by-side layout,
+including wrapped rows); falls back to the inline-only heuristic when the parser
+is unavailable."
+  (let ((old nil) (new nil))
+    (if-let* ((lines (magit-difftastic--parse-chunk-lines section)))
+        (dolist (l lines)
+          (pcase-let ((`(,_ ,left ,right) l))
+            (when (car left)  (push (car left) old))
+            (when (car right) (push (car right) new))))
+      ;; Legacy fallback (inline only) when difftastic's parser is unavailable.
+      (save-excursion
+        (goto-char (or (oref section content) (oref section start)))
+        (while (< (point) (oref section end))
+          (when-let* ((sn (magit-difftastic--line-side+num
+                           (buffer-substring-no-properties
+                            (line-beginning-position) (line-end-position)))))
+            (pcase (car sn)
+              ('old (push (cdr sn) old))
+              ('new (push (cdr sn) new))))
+          (forward-line))))
+    (cons (nreverse old) (nreverse new))))
+
+(defun magit-difftastic--chunk-visit-line (section)
+  "Return the 1-based worktree line to visit for chunk SECTION, or nil.
+Prefers the chunk's first new-side (rhs) displayed line, so visiting lands on
+the change in the worktree; falls back to the first old-side (lhs) line for a
+pure deletion.
+
+Read from SECTION's rendered gutters (see
+`magit-difftastic--chunk-displayed-lines'), so it follows whatever the section
+actually shows rather than indexing difft's `--display json' chunks (whose
+ordinals can drift from the displayed sections).
+
+\(We deliberately do not try to compute a column: difft only marks changed
+tokens for recognized languages -- for plain text every span is `normal' -- so
+a derived column would be misleading.  Visiting lands on the line and its first
+non-whitespace character instead.)"
+  (let ((lines (magit-difftastic--chunk-displayed-lines section)))
+    (or (car (cdr lines)) (car (car lines)))))
+
 (defun magit-difftastic--chunk-patch (section)
   "Build a standalone git patch string for the chunk SECTION, or nil.
 The patch contains the file header plus exactly the git hunk(s) that the
-difftastic chunk maps onto."
+difftastic chunk maps onto.  The chunk's old/new line numbers are read from
+SECTION's rendered gutters (`magit-difftastic--chunk-displayed-lines')."
   (let* ((val (oref section value))
          (file (plist-get val :file))
-         (index (plist-get val :index))
          (staged (plist-get val :staged))
-         (diff-args (plist-get val :diff-args))
          (parsed (magit-difftastic--parse-diff (magit-difftastic--git-diff-raw file staged)))
          (header (car parsed))
          (hunks (cdr parsed))
-         (lines (magit-difftastic--json-chunk-lines file diff-args index))
+         (lines (magit-difftastic--chunk-displayed-lines section))
          (matched (cl-remove-if-not
                    (lambda (h) (magit-difftastic--hunk-covers-p h (car lines) (cdr lines)))
                    hunks)))
@@ -1138,14 +1128,15 @@ Difftastic inline rows are prefixed with a right-aligned line number."
                (match-string 1 l)))
            body-lines))
 
-(defun magit-difftastic--insert-chunk (body-lines file index context)
+(defun magit-difftastic--insert-chunk (body-lines file context)
   "Insert one collapsible chunk section from BODY-LINES (difft header removed).
-FILE is the repo-relative path and INDEX is the chunk's 0-based position in the
-file's difftastic output (matching `difft --display json' chunk order).
-CONTEXT is the diff context plist (see
-`magit-difftastic--insert-file-sections'); its `:diff-args', `:staged' and
-`:stageable' entries are stored on the section value so the staging commands
-can rebuild the corresponding git hunk."
+FILE is the repo-relative path.  CONTEXT is the diff context plist (see
+`magit-difftastic--insert-file-sections'); its `:staged' and `:stageable'
+entries are stored on the section value so the staging commands can rebuild the
+corresponding git hunk.  The chunk's line numbers are not stored: the staging
+and visiting commands read them from the section's rendered gutters (see
+`magit-difftastic--chunk-displayed-lines'), which stays aligned with what the
+section displays even when difft's text display merges several JSON chunks."
   ;; Drop leading/trailing blank lines that difft puts between chunks.
   (while (and body-lines (string-blank-p (car body-lines)))
     (setq body-lines (cdr body-lines)))
@@ -1158,8 +1149,7 @@ can rebuild the corresponding git hunk."
            (heading (if start (format "@@ line %s @@" start) "@@ @@")))
       (magit-insert-section section
           (magit-difftastic-hunk
-           (list :file file :index index
-                 :diff-args (plist-get context :diff-args)
+           (list :file file
                  :staged (plist-get context :staged)
                  :stageable (plist-get context :stageable)
                  :line (and start (string-to-number start)))
@@ -1193,25 +1183,23 @@ can rebuild the corresponding git hunk."
 
 (defun magit-difftastic--insert-chunks (rendered file context)
   "Split RENDERED difftastic output for FILE into collapsible per-chunk sections.
-Difftastic's own `FILE --- N/M --- LANG' headers are consumed (not shown).
-The chunk INDEX passed to `magit-difftastic--insert-chunk' increments once per
-difftastic chunk header so it stays aligned with `difft --display json'.
-CONTEXT is the diff context plist threaded down to each chunk section."
+Difftastic's own `FILE --- N/M --- LANG' headers are consumed (not shown); each
+run of text between them becomes one displayed chunk section.  CONTEXT is the
+diff context plist threaded down to each chunk section."
   (let ((header-re (difftastic--chunk-regexp t))
         (lines (split-string rendered "\n"))
         (chunk nil)
-        (index -1)
         (started nil))
     (dolist (line lines)
       (if (string-match-p header-re line)
           (progn
             (when started
-              (magit-difftastic--insert-chunk (nreverse chunk) file index context))
-            (setq chunk nil started t index (1+ index)))
+              (magit-difftastic--insert-chunk (nreverse chunk) file context))
+            (setq chunk nil started t))
         (when started
           (push line chunk))))
     (when started
-      (magit-difftastic--insert-chunk (nreverse chunk) file index context))))
+      (magit-difftastic--insert-chunk (nreverse chunk) file context))))
 
 (defun magit-difftastic--file-statuses (diff-args)
   "Return an alist of (PATH . (STATUS . ORIG)) for the DIFF-ARGS diff.

@@ -109,6 +109,24 @@ CONTENT is the body start; VALUE, when given, is stored as the section value."
     (when value (oset s value value))
     s))
 
+(defun dst-test--display-chunk-bodies (file display)
+  "Return a list of difft display-chunk body strings for FILE in DISPLAY mode.
+Splits FILE's rendered difftastic output on difft's own `FILE --- N/M --- LANG'
+chunk headers, exactly as `magit-difftastic--insert-chunks' does, so each
+element is one displayed chunk's body (the header line dropped)."
+  (let* ((magit-difftastic-display display)
+         (rendered (magit-difftastic--file-diff-string
+                    file magit-difftastic--diff-base))
+         (header-re (difftastic--chunk-regexp t))
+         (bodies nil) (chunk nil) (started nil))
+    (dolist (line (split-string rendered "\n"))
+      (if (string-match-p header-re line)
+          (progn (when started (push (string-join (nreverse chunk) "\n") bodies))
+                 (setq chunk nil started t))
+        (when started (push line chunk))))
+    (when started (push (string-join (nreverse chunk) "\n") bodies))
+    (nreverse bodies)))
+
 (defmacro dst-test--with-region (beg end &rest body)
   "Evaluate BODY with `region-beginning'/`region-end' stubbed to BEG and END."
   (declare (indent 2))
@@ -276,24 +294,74 @@ side-by-side the row carries both sides, so the whole modification is staged."
 ;;;; Integration: whole-chunk staging --------------------------------------
 
 (ert-deftest magit-difftastic-integration/chunk-patch-stages-whole-chunk ()
-  "`--chunk-patch' (no region) stages every change the chunk covers."
+  "`--chunk-patch' (no region) stages every change the chunk covers.
+The chunk's line numbers are read from the SECTION's rendered gutters, so the
+section is built over real difftastic-rendered text."
   (skip-unless dst-test--have-tools)
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
       `(("sample.txt" . ,dst-test--new))
-    (let* ((value (list :file "sample.txt" :index 0 :staged nil
-                        :diff-args magit-difftastic--diff-base))
-           (sec (dst-test--make-section 1 1 1 value))
-           (patch (magit-difftastic--chunk-patch sec)))
-      (should patch)
+    (let ((magit-difftastic-display "side-by-side-show-both"))
       (with-temp-buffer
-        (insert patch)
-        (should (eq 0 (call-process-region
-                       (point-min) (point-max) "git" nil nil nil
-                       "apply" "--cached" "-"))))
-      (let ((staged (dst-test--git "--no-pager" "diff" "--cached")))
-        (should (string-match-p "^\\+BRAVO-changed$" staged))
-        (should (string-match-p "^\\+delta-modified$" staged))
-        (should (string-match-p "^\\+golf-added$" staged))))))
+        (insert (dst-test--chunk-buffer-string "sample.txt" "side-by-side-show-both"))
+        (let* ((value (list :file "sample.txt" :staged nil))
+               (sec (dst-test--make-section
+                     (point-min)
+                     (save-excursion (goto-char (point-min)) (line-end-position))
+                     (point-max) value))
+               (patch (magit-difftastic--chunk-patch sec)))
+          (should patch)
+          (with-temp-buffer
+            (insert patch)
+            (should (eq 0 (call-process-region
+                           (point-min) (point-max) "git" nil nil nil
+                           "apply" "--cached" "-"))))
+          (let ((staged (dst-test--git "--no-pager" "diff" "--cached")))
+            (should (string-match-p "^\\+BRAVO-changed$" staged))
+            (should (string-match-p "^\\+delta-modified$" staged))
+            (should (string-match-p "^\\+golf-added$" staged))))))))
+
+(ert-deftest magit-difftastic-integration/chunk-patch-maps-displayed-section ()
+  "`--chunk-patch' maps a section onto the hunk it DISPLAYS, not its ordinal.
+difft's text display can merge several `--display json' chunks into one
+displayed section, so a section's display position is NOT a valid index into the
+JSON chunk list -- keying off it staged an unrelated hunk (discarding one chunk
+reverted a different one).
+
+Here two well-separated changes render as two display chunks.  We build a
+section over the SECOND chunk but tag it with a stale `:index 0' (what the buggy
+code keyed off); the patch must still target the SECOND change."
+  (skip-unless dst-test--have-tools)
+  (let* ((base (cl-loop for i from 1 to 20
+                        collect (format "(defvar var-%d %d)" i i)))
+         (old (concat ";;; m.el -*- lexical-binding: t; -*-\n"
+                      (string-join base "\n") "\n"))
+         (new (concat
+               ";;; m.el -*- lexical-binding: t; -*-\n"
+               (string-join
+                (cl-loop for i from 1 to 20
+                         collect (cond ((= i 3)  "(defvar var-3 999)")
+                                       ((= i 17) "(defvar var-17 888)")
+                                       (t (format "(defvar var-%d %d)" i i))))
+                "\n")
+               "\n")))
+    (dst-test--with-repo `(("m.el" . ,old)) `(("m.el" . ,new))
+      (let ((magit-difftastic-display "side-by-side-show-both"))
+        (let ((bodies (dst-test--display-chunk-bodies "m.el" "side-by-side-show-both")))
+          ;; The two distant changes render as two separate displayed chunks.
+          (should (= (length bodies) 2))
+          (with-temp-buffer
+            (insert "@@ line 16 @@\n" (nth 1 bodies) "\n")
+            (let* ((value (list :file "m.el" :index 0 :staged nil))
+                   (sec (dst-test--make-section
+                         (point-min)
+                         (save-excursion (goto-char (point-min)) (line-end-position))
+                         (point-max) value))
+                   (patch (magit-difftastic--chunk-patch sec)))
+              (should patch)
+              ;; The SECOND change is staged ...
+              (should (string-match-p "var-17" patch))
+              ;; ... and the FIRST change is NOT.
+              (should-not (string-match-p "var-3 " patch)))))))))
 
 ;;;; Integration: line-number hiding ---------------------------------------
 
