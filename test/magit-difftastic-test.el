@@ -345,6 +345,38 @@ side-by-side the row carries both sides, so the whole modification is staged."
       ;; A brand new file is untracked, so it is not part of the tracked diff.
       (should-not (assoc "fresh.txt" statuses)))))
 
+(ert-deftest magit-difftastic-integration/file-statuses-rename ()
+  "A staged rename is reported once as \"renamed\" keyed on the NEW path.
+The porcelain diff (`--file-statuses') detects the rename and carries the OLD
+path as ORIG, while plumbing (`git diff-index --name-only', what
+`magit-staged-files' uses) lists BOTH the OLD (deletion) and NEW paths.  The
+renderer relies on the ORIG to drop that stray OLD entry; see
+`magit-difftastic--insert-file-sections'."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("original.txt" . "alpha\nbravo\ncharlie\n")) nil
+    (dst-test--git "mv" "original.txt" "renamed.txt")
+    (dst-test--git "add" "-A")
+    (let* ((diff-args (append magit-difftastic--diff-base '("--cached")))
+           (statuses (magit-difftastic--file-statuses diff-args))
+           (info (cdr (assoc "renamed.txt" statuses)))
+           ;; Same extraction the renderer performs to suppress the stray OLD.
+           (rename-origins (delq nil
+                                 (mapcar (lambda (s)
+                                           (and (equal (cadr s) "renamed")
+                                                (cddr s)))
+                                         statuses))))
+      ;; The rename is reported once, keyed on the NEW path, with ORIG = OLD.
+      (should (equal (car info) "renamed"))
+      (should (equal (cdr info) "original.txt"))
+      ;; The OLD path is NOT reported as its own (deleted/modified) entry ...
+      (should-not (assoc "original.txt" statuses))
+      ;; ... but plumbing DOES list it, so the renderer must filter it out.
+      (should (member "original.txt"
+                      (split-string
+                       (dst-test--git "diff-index" "--name-only" "--cached" "HEAD")
+                       "\n" t)))
+      (should (member "original.txt" rename-origins)))))
+
 ;;;; Unit tests: major-mode detection -------------------------------------
 
 (ert-deftest magit-difftastic--mode-for-file/recognizes-and-rejects ()

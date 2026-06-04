@@ -1333,16 +1333,30 @@ like it expands straight to its diff in Magit."
   ;; needs it: for the Magit-matching heading and initial visibility).  A fresh
   ;; syntax cache is bound for this group so each file's old/new source is
   ;; fetched and fontified at most once across its chunks.
-  (let ((statuses (and (cl-some (lambda (f)
-                                  (not (member f magit-difftastic--stock-files)))
-                                files)
-                       (magit-difftastic--file-statuses
-                        (plist-get context :diff-args))))
-        (magit-difftastic--syntax-cache (make-hash-table :test 'equal)))
+  (let* ((statuses (and (cl-some (lambda (f)
+                                   (not (member f magit-difftastic--stock-files)))
+                                 files)
+                        (magit-difftastic--file-statuses
+                         (plist-get context :diff-args))))
+         ;; The porcelain `git diff' used for STATUSES detects renames and
+         ;; reports each as a single "renamed: OLD -> NEW" entry.  FILES,
+         ;; however, comes from plumbing (`git diff-index --name-only', via
+         ;; `magit-{un,}staged-files'), which does NOT detect renames and so
+         ;; lists a rename's OLD path as a separate deletion.  Drop those rename
+         ;; sources: otherwise OLD -- absent from STATUSES -- would fall back to
+         ;; the default "modified" heading and a bogus "Modified: OLD" section
+         ;; would render alongside the real "renamed: OLD -> NEW" one.
+         (rename-origins (delq nil
+                               (mapcar (lambda (s)
+                                         (and (equal (cadr s) "renamed")
+                                              (cddr s)))
+                                       statuses)))
+         (magit-difftastic--syntax-cache (make-hash-table :test 'equal)))
     (dolist (file files)
-      (if (member file magit-difftastic--stock-files)
-          (magit-difftastic--insert-stock-file file context)
-        (magit-difftastic--insert-difftastic-file file context statuses)))))
+      (unless (member file rename-origins)
+        (if (member file magit-difftastic--stock-files)
+            (magit-difftastic--insert-stock-file file context)
+          (magit-difftastic--insert-difftastic-file file context statuses))))))
 
 (defun magit-difftastic--context-unstaged ()
   "Diff context plist for the worktree-vs-index (unstaged) diff."
