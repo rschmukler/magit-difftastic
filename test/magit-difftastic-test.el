@@ -445,6 +445,47 @@ renderer relies on the ORIG to drop that stray OLD entry; see
                        "\n" t)))
       (should (member "original.txt" rename-origins)))))
 
+;;;; Integration: parallel rendering ---------------------------------------
+
+(ert-deftest magit-difftastic-integration/render-files-matches-sync ()
+  "`--render-files' renders a batch in parallel, matching the sync path.
+Each file's parallel result must equal what `--render-raw' produces serially,
+and every requested file must be present in the returned hash."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
+                         ("b.txt" . "one\ntwo\nthree\n")
+                         ("c.txt" . "uno\ndos\n"))
+      '(("a.txt" . "alpha\nBRAVO\n")
+        ("b.txt" . "one\nTWO\nthree\nfour\n")
+        ("c.txt" . "uno\nDOS\ntres\n"))
+    (let* ((files '("a.txt" "b.txt" "c.txt"))
+           (width (magit-difftastic--width))
+           (jobs (mapcar (lambda (f) (cons f magit-difftastic--diff-base)) files))
+           (parallel (magit-difftastic--render-files jobs width)))
+      (should (= (hash-table-count parallel) (length files)))
+      (dolist (f files)
+        (should (equal (gethash f parallel)
+                       (magit-difftastic--render-raw
+                        f magit-difftastic--diff-base width)))))))
+
+(ert-deftest magit-difftastic-integration/render-files-serial-limit ()
+  "`--render-files' still yields correct output when limited to one job at a time."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
+                         ("b.txt" . "one\ntwo\n"))
+      '(("a.txt" . "alpha\nBRAVO\n")
+        ("b.txt" . "ONE\ntwo\n"))
+    (let* ((magit-difftastic-render-jobs 1)
+           (files '("a.txt" "b.txt"))
+           (width (magit-difftastic--width))
+           (jobs (mapcar (lambda (f) (cons f magit-difftastic--diff-base)) files))
+           (parallel (magit-difftastic--render-files jobs width)))
+      (should (= (hash-table-count parallel) (length files)))
+      (dolist (f files)
+        (should (equal (gethash f parallel)
+                       (magit-difftastic--render-raw
+                        f magit-difftastic--diff-base width)))))))
+
 ;;;; Unit tests: major-mode detection -------------------------------------
 
 (ert-deftest magit-difftastic--mode-for-file/recognizes-and-rejects ()

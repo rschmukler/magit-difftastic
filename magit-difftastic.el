@@ -111,9 +111,11 @@
 ;;     point); a region spanning multiple chunks/files only affects the chunk
 ;;     that contains it.  Whole-chunk staging snaps to the underlying git hunk
 ;;     boundary -- the same boundary Magit's own per-hunk staging uses.
-;;   - `difft' is run synchronously, once per changed file, on every status
-;;     refresh (plus one extra `difft --display json' per staging action).  On
-;;     large change sets this can make `magit-status' sluggish.
+;;   - `difft' is run once per changed file on every status refresh.  The files
+;;     in a section are rendered concurrently (up to `magit-difftastic-render-jobs'
+;;     processes at a time), so a refresh costs roughly its slowest file rather
+;;     than the sum of all of them, but a very large change set can still make
+;;     `magit-status' sluggish since the refresh waits for the whole batch.
 ;;   - Untracked files are still rendered by the stock
 ;;     `magit-insert-untracked-files'.
 ;;   - In `magit-diff-mode'/`magit-revision-mode' buffers the difftastic
@@ -198,6 +200,20 @@ At least `magit-difftastic-min-width' columns are always used.  The
   :type 'integer
   :group 'magit-difftastic)
 
+(defcustom magit-difftastic-render-jobs nil
+  "Maximum number of `difft' processes to run concurrently while rendering.
+On every refresh each changed file is rendered by its own `difft' subprocess;
+running them concurrently makes the rendering wall-clock time roughly the
+slowest single file rather than the sum of all of them.
+
+  - nil (default): use the number of available processors (when Emacs can
+    report it), capped at a sensible maximum, else a small fixed number.
+  - a positive integer: run at most that many `difft' processes at once.  A
+    value of 1 renders serially (the pre-2.x behaviour)."
+  :type '(choice (const :tag "Auto (number of processors)" nil)
+                 (integer :tag "Fixed maximum"))
+  :group 'magit-difftastic)
+
 (defun magit-difftastic--width ()
   "Width in columns to request from difft for the current buffer."
   (max magit-difftastic-min-width
@@ -214,29 +230,112 @@ appended to this.")
   "Leading git invocation for difftastic `git show' (commit) rendering.
 The revision and the `-- FILE' pathspec are appended to this.")
 
+(defvar magit-difftastic--render-cache nil
+  "Dynamically-bound hash of FILE -> pre-rendered difft string for one group.
+Bound in `magit-difftastic--insert-file-sections' to the result of rendering
+that group's files in parallel (see `magit-difftastic--render-files'), so the
+synchronous section-insertion pass reads each file's already-computed difft
+output instead of spawning a subprocess inline.  A cache miss falls back to a
+direct synchronous render, so the cache is purely an optimisation.")
+
+(defun magit-difftastic--render-raw (file diff-args width)
+  "Run `git DIFF-ARGS -- FILE' through difft at WIDTH and return propertized text.
+Synchronous; used as the fallback when no pre-warmed entry exists (see
+`magit-difftastic--render-cache') and as the worker the parallel runner mirrors."
+  (require 'difftastic)
+  (let ((raw (with-temp-buffer
+               ;; `difftastic--build-git-process-environment' sets
+               ;; GIT_EXTERNAL_DIFF=difft ... so plain `git diff --ext-diff'
+               ;; routes through difftastic.  We append `--display' per
+               ;; `magit-difftastic-display'.
+               (let ((process-environment
+                      (difftastic--build-git-process-environment
+                       width (list "--display" magit-difftastic-display))))
+                 (apply #'process-file "git" nil t nil
+                        (append diff-args (list "--" file))))
+               (buffer-string))))
+    ;; Turn difft's ANSI escapes into propertized text using difftastic's
+    ;; own colour vectors (so it matches `difftastic-magit-diff').
+    (difftastic--ansi-color-apply raw)))
+
 (defun magit-difftastic--file-diff-string (file diff-args)
   "Return the difftastic-rendered, fontified diff STRING for FILE.
 DIFF-ARGS is the leading git invocation (including `--no-pager', the
 subcommand and `--ext-diff') that selects which diff to render; FILE is
 appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
 \"--cached\")' renders the index against HEAD, while
-`(\"--no-pager\" \"show\" \"--ext-diff\" \"--format=\" REV)' renders a commit."
+`(\"--no-pager\" \"show\" \"--ext-diff\" \"--format=\" REV)' renders a commit.
+
+When `magit-difftastic--render-cache' holds a pre-warmed entry for FILE (the
+common case during a refresh, where the whole group was rendered in parallel up
+front) it is returned directly; otherwise FILE is rendered synchronously now."
+  (or (and magit-difftastic--render-cache
+           (gethash file magit-difftastic--render-cache))
+      (magit-difftastic--render-raw file diff-args (magit-difftastic--width))))
+
+(defun magit-difftastic--max-jobs ()
+  "Return the maximum number of concurrent difft processes to run.
+Honours `magit-difftastic-render-jobs'; when that is nil, uses the processor
+count (capped) when Emacs can report it, else a small fixed default."
+  (cond
+   ((integerp magit-difftastic-render-jobs)
+    (max 1 magit-difftastic-render-jobs))
+   ((fboundp 'num-processors) (max 1 (min 16 (num-processors))))
+   (t 4)))
+
+(defun magit-difftastic--render-files (jobs width)
+  "Render difft for JOBS in parallel; return a hash of FILE -> rendered string.
+JOBS is a list of (FILE . DIFF-ARGS).  Each job runs `git DIFF-ARGS -- FILE'
+through difft (exactly as `magit-difftastic--render-raw' does synchronously) at
+WIDTH columns, but up to `magit-difftastic--max-jobs' of them run concurrently
+via `start-file-process' (the TRAMP-aware async counterpart of `process-file'),
+so a group's rendering cost is roughly its slowest file rather than the sum.
+
+Blocks until every job has finished, then returns the populated hash; a job
+whose process fails simply yields nil for that file, so the caller falls back to
+a synchronous render."
   (require 'difftastic)
-  (let* ((width (magit-difftastic--width))
-         (args (append diff-args (list "--" file)))
-         (raw (with-temp-buffer
-                ;; `difftastic--build-git-process-environment' sets
-                ;; GIT_EXTERNAL_DIFF=difft ... so plain `git diff --ext-diff'
-                ;; routes through difftastic.  We append `--display' per
-                ;; `magit-difftastic-display'.
-                (let ((process-environment
-                       (difftastic--build-git-process-environment
-                        width (list "--display" magit-difftastic-display))))
-                  (apply #'process-file "git" nil t nil args))
-                (buffer-string))))
-    ;; Turn difft's ANSI escapes into propertized text using difftastic's
-    ;; own colour vectors (so it matches `difftastic-magit-diff').
-    (difftastic--ansi-color-apply raw)))
+  (let* ((results (make-hash-table :test 'equal))
+         (queue (copy-sequence jobs))
+         (max-jobs (magit-difftastic--max-jobs))
+         (running 0)
+         (pending (length jobs))
+         ;; difft is selected purely through the environment (GIT_EXTERNAL_DIFF
+         ;; etc.); the same env is reused for every process in the group.
+         (env (difftastic--build-git-process-environment
+               width (list "--display" magit-difftastic-display))))
+    (cl-labels
+        ((launch ()
+           (while (and queue (< running max-jobs))
+             (let* ((job (pop queue))
+                    (file (car job))
+                    (args (append (cdr job) (list "--" file)))
+                    (buf (generate-new-buffer " *magit-difftastic-render*"))
+                    (process-environment env)
+                    (proc (apply #'start-file-process
+                                 "magit-difftastic-render" buf "git" args)))
+               (cl-incf running)
+               (set-process-query-on-exit-flag proc nil)
+               (set-process-sentinel
+                proc
+                (lambda (p _event)
+                  (unless (process-live-p p)
+                    (let ((b (process-buffer p)))
+                      (when (buffer-live-p b)
+                        (with-current-buffer b
+                          (puthash file
+                                   (difftastic--ansi-color-apply (buffer-string))
+                                   results))
+                        (kill-buffer b)))
+                    (cl-decf running)
+                    (cl-decf pending)
+                    ;; A finished slot frees room for the next queued job.
+                    (launch))))))))
+      (launch)
+      ;; Pump the event loop until every sentinel has fired.
+      (while (> pending 0)
+        (accept-process-output nil 0.05)))
+    results))
 
 ;;; Per-chunk staging
 ;;
@@ -1339,7 +1438,25 @@ like it expands straight to its diff in Magit."
                                          (and (equal (cadr s) "renamed")
                                               (cddr s)))
                                        statuses)))
-         (magit-difftastic--syntax-cache (make-hash-table :test 'equal)))
+         (magit-difftastic--syntax-cache (make-hash-table :test 'equal))
+         ;; Pre-warm: render every difftastic-rendered file in this group in
+         ;; parallel up front (stock-rendered files and rename sources are
+         ;; skipped -- the former go through `magit--insert-diff', the latter
+         ;; are not shown).  The synchronous insertion loop below then reads
+         ;; each file's already-computed difft output from this cache via
+         ;; `magit-difftastic--file-diff-string', turning N serial subprocess
+         ;; spawns per refresh into one parallel batch.
+         (magit-difftastic--render-cache
+          (let ((render-files
+                 (cl-remove-if
+                  (lambda (f) (or (member f magit-difftastic--stock-files)
+                                  (member f rename-origins)))
+                  files)))
+            (when render-files
+              (magit-difftastic--render-files
+               (mapcar (lambda (f) (cons f (plist-get context :diff-args)))
+                       render-files)
+               (magit-difftastic--width))))))
     (dolist (file files)
       (unless (member file rename-origins)
         (if (member file magit-difftastic--stock-files)
