@@ -1,8 +1,8 @@
-;;; difftastic-status-test.el --- Tests for difftastic-status -*- lexical-binding: t; -*-
+;;; magit-difftastic-test.el --- Tests for magit-difftastic -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; ERT test suite for difftastic-status.
+;; ERT test suite for magit-difftastic.
 ;;
 ;; Two kinds of tests live here:
 ;;
@@ -17,14 +17,14 @@
 ;;
 ;; Run with `eldev test', or directly:
 ;;
-;;   emacs -batch -L . -L test -l test/difftastic-status-test.el \
+;;   emacs -batch -L . -L test -l test/magit-difftastic-test.el \
 ;;     -f ert-run-tests-batch-and-exit
 
 ;;; Code:
 
 (require 'ert)
 (require 'cl-lib)
-(require 'difftastic-status)
+(require 'magit-difftastic)
 
 ;;;; Fixtures --------------------------------------------------------------
 
@@ -89,20 +89,20 @@ afterwards."
 
 (defun dst-test--chunk-buffer-string (file display)
   "Return a chunk buffer string (heading + difft body) for FILE in DISPLAY mode.
-Mirrors what `difftastic-status--insert-chunk' inserts: difft's own
+Mirrors what `magit-difftastic--insert-chunk' inserts: difft's own
 `FILE --- LANG' header line is dropped and our `@@ line N @@' heading prepended.
 Assumes FILE's change renders as a single difftastic chunk."
-  (let* ((difftastic-status-display display)
-         (rendered (difftastic-status--file-diff-string
-                    file difftastic-status--diff-base))
+  (let* ((magit-difftastic-display display)
+         (rendered (magit-difftastic--file-diff-string
+                    file magit-difftastic--diff-base))
          (body (mapconcat #'identity (cdr (split-string rendered "\n")) "\n")))
     (concat "@@ line 1 @@\n" body)))
 
 (defun dst-test--make-section (beg content end &optional value)
-  "Build a minimal `difftastic-hunk' section spanning BEG..END.
+  "Build a minimal `magit-difftastic-hunk' section spanning BEG..END.
 CONTENT is the body start; VALUE, when given, is stored as the section value."
   (let ((s (magit-section)))
-    (oset s type 'difftastic-hunk)
+    (oset s type 'magit-difftastic-hunk)
     (oset s start beg)
     (oset s content content)
     (oset s end end)
@@ -118,7 +118,7 @@ CONTENT is the body start; VALUE, when given, is stored as the section value."
 
 ;;;; Unit tests: diff parsing ----------------------------------------------
 
-(ert-deftest difftastic-status--parse-diff/header-and-hunks ()
+(ert-deftest magit-difftastic--parse-diff/header-and-hunks ()
   "Header is captured and each @@ hunk parsed with correct ranges and text."
   (let* ((diff (concat "diff --git a/f b/f\n"
                        "index 1111111..2222222 100644\n"
@@ -131,7 +131,7 @@ CONTENT is the body start; VALUE, when given, is stored as the section value."
                        "@@ -10 +10,2 @@\n"
                        " ctx\n"
                        "+added\n"))
-         (parsed (difftastic-status--parse-diff diff))
+         (parsed (magit-difftastic--parse-diff diff))
          (header (car parsed))
          (hunks (cdr parsed)))
     (should (string-match-p "diff --git a/f b/f" header))
@@ -151,83 +151,83 @@ CONTENT is the body start; VALUE, when given, is stored as the section value."
       (should (= (plist-get h :new-beg) 10))
       (should (= (plist-get h :new-len) 2)))))
 
-(ert-deftest difftastic-status--parse-diff/empty ()
+(ert-deftest magit-difftastic--parse-diff/empty ()
   "Empty diff text yields an empty header and no hunks."
-  (let ((parsed (difftastic-status--parse-diff "")))
+  (let ((parsed (magit-difftastic--parse-diff "")))
     (should (equal (car parsed) ""))
     (should (null (cdr parsed)))))
 
-(ert-deftest difftastic-status--split-hunks/counts ()
+(ert-deftest magit-difftastic--split-hunks/counts ()
   "Hunk-only text is split on each @@ boundary."
   (let ((text "@@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d\n"))
-    (should (= (length (difftastic-status--split-hunks text)) 2)))
-  (should (null (difftastic-status--split-hunks ""))))
+    (should (= (length (magit-difftastic--split-hunks text)) 2)))
+  (should (null (magit-difftastic--split-hunks ""))))
 
 ;;;; Unit tests: hunk overlap ----------------------------------------------
 
-(ert-deftest difftastic-status--hunk-covers-p/old-side ()
+(ert-deftest magit-difftastic--hunk-covers-p/old-side ()
   (let ((h (list :old-beg 5 :old-len 3 :new-beg 5 :new-len 0)))
-    (should (difftastic-status--hunk-covers-p h '(5) nil))
-    (should (difftastic-status--hunk-covers-p h '(7) nil))
-    (should-not (difftastic-status--hunk-covers-p h '(8) nil))
+    (should (magit-difftastic--hunk-covers-p h '(5) nil))
+    (should (magit-difftastic--hunk-covers-p h '(7) nil))
+    (should-not (magit-difftastic--hunk-covers-p h '(8) nil))
     ;; A zero-length new side never matches a new line.
-    (should-not (difftastic-status--hunk-covers-p h nil '(5)))))
+    (should-not (magit-difftastic--hunk-covers-p h nil '(5)))))
 
-(ert-deftest difftastic-status--hunk-covers-p/new-side ()
+(ert-deftest magit-difftastic--hunk-covers-p/new-side ()
   (let ((h (list :old-beg 1 :old-len 0 :new-beg 4 :new-len 2)))
-    (should (difftastic-status--hunk-covers-p h nil '(4)))
-    (should (difftastic-status--hunk-covers-p h nil '(5)))
-    (should-not (difftastic-status--hunk-covers-p h nil '(6)))
+    (should (magit-difftastic--hunk-covers-p h nil '(4)))
+    (should (magit-difftastic--hunk-covers-p h nil '(5)))
+    (should-not (magit-difftastic--hunk-covers-p h nil '(6)))
     ;; A zero-length old side never matches an old line.
-    (should-not (difftastic-status--hunk-covers-p h '(1) nil))))
+    (should-not (magit-difftastic--hunk-covers-p h '(1) nil))))
 
 ;;;; Unit tests: line classification + heading -----------------------------
 
-(ert-deftest difftastic-status--line-side+num/classifies ()
-  (should (equal (difftastic-status--line-side+num "12 foo") '(old . 12)))
-  (should (equal (difftastic-status--line-side+num "   7 bar") '(new . 7)))
-  (should-not (difftastic-status--line-side+num "@@ line @@"))
-  (should-not (difftastic-status--line-side+num "")))
+(ert-deftest magit-difftastic--line-side+num/classifies ()
+  (should (equal (magit-difftastic--line-side+num "12 foo") '(old . 12)))
+  (should (equal (magit-difftastic--line-side+num "   7 bar") '(new . 7)))
+  (should-not (magit-difftastic--line-side+num "@@ line @@"))
+  (should-not (magit-difftastic--line-side+num "")))
 
-(ert-deftest difftastic-status--chunk-start-line/first-number ()
-  (should (equal (difftastic-status--chunk-start-line '("   42 foo" "43 bar")) "42"))
-  (should (equal (difftastic-status--chunk-start-line '("7 x")) "7"))
-  (should-not (difftastic-status--chunk-start-line '("no numbers" "here"))))
+(ert-deftest magit-difftastic--chunk-start-line/first-number ()
+  (should (equal (magit-difftastic--chunk-start-line '("   42 foo" "43 bar")) "42"))
+  (should (equal (magit-difftastic--chunk-start-line '("7 x")) "7"))
+  (should-not (magit-difftastic--chunk-start-line '("no numbers" "here"))))
 
 ;;;; Unit tests: width / wrapping knob -------------------------------------
 
-(ert-deftest difftastic-status--width/honors-custom ()
-  (let ((difftastic-status-min-width 40))
-    (let ((difftastic-status-width 100))
-      (should (= (difftastic-status--width) 100)))
-    ;; Below the floor, clamp to `difftastic-status-min-width'.
-    (let ((difftastic-status-width 10))
-      (should (= (difftastic-status--width) 40)))
+(ert-deftest magit-difftastic--width/honors-custom ()
+  (let ((magit-difftastic-min-width 40))
+    (let ((magit-difftastic-width 100))
+      (should (= (magit-difftastic--width) 100)))
+    ;; Below the floor, clamp to `magit-difftastic-min-width'.
+    (let ((magit-difftastic-width 10))
+      (should (= (magit-difftastic--width) 40)))
     ;; The window default still respects the floor.
-    (let ((difftastic-status-width 'window))
-      (should (>= (difftastic-status--width) 40))))
+    (let ((magit-difftastic-width 'window))
+      (should (>= (magit-difftastic--width) 40))))
   ;; A custom floor is honored too.
-  (let ((difftastic-status-min-width 72)
-        (difftastic-status-width 10))
-    (should (= (difftastic-status--width) 72))))
+  (let ((magit-difftastic-min-width 72)
+        (magit-difftastic-width 10))
+    (should (= (magit-difftastic--width) 72))))
 
 ;;;; Integration: rendering + parsing --------------------------------------
 
-(ert-deftest difftastic-status-integration/classify-and-parse ()
+(ert-deftest magit-difftastic-integration/classify-and-parse ()
   "difftastic's parser classifies each rendered chunk and yields line numbers."
   (skip-unless dst-test--have-tools)
   (skip-unless (fboundp 'difftastic--classify-chunk))
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
       `(("sample.txt" . ,dst-test--new))
     (dolist (display dst-test--displays)
-      (let ((difftastic-status-display display))
+      (let ((magit-difftastic-display display))
         (with-temp-buffer
           (insert (dst-test--chunk-buffer-string "sample.txt" display))
           (let ((expected (if (equal display "inline")
                               'single-column 'side-by-side))
-                (lines (difftastic-status--parse-chunk-bounds
+                (lines (magit-difftastic--parse-chunk-bounds
                         (point-min) (point-max))))
-            (should (eq (difftastic-status--chunk-layout (point-min) (point-max))
+            (should (eq (magit-difftastic--chunk-layout (point-min) (point-max))
                         expected))
             (should lines)
             ;; Every old/new number difft reports is a real file line (1..7).
@@ -238,7 +238,7 @@ CONTENT is the body start; VALUE, when given, is stored as the section value."
 
 ;;;; Integration: region (line-range) staging ------------------------------
 
-(ert-deftest difftastic-status-integration/region-staging-resolves ()
+(ert-deftest magit-difftastic-integration/region-staging-resolves ()
   "Selecting the modified row stages the correct change in every layout.
 In inline the row is new-side only, so only the addition is staged; in
 side-by-side the row carries both sides, so the whole modification is staged."
@@ -246,7 +246,7 @@ side-by-side the row carries both sides, so the whole modification is staged."
   (dolist (display dst-test--displays)
     (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
         `(("sample.txt" . ,dst-test--new))
-      (let ((difftastic-status-display display))
+      (let ((magit-difftastic-display display))
        (with-temp-buffer
         (insert (dst-test--chunk-buffer-string "sample.txt" display))
         (goto-char (point-min))
@@ -254,8 +254,8 @@ side-by-side the row carries both sides, so the whole modification is staged."
                     (point-min) (line-end-position) (point-max))))
           (search-forward "delta-modified")
           (dst-test--with-region (line-beginning-position) (line-end-position)
-            (let* ((sel (difftastic-status--region-selected-lines sec))
-                   (patch (difftastic-status--region-patch
+            (let* ((sel (magit-difftastic--region-selected-lines sec))
+                   (patch (magit-difftastic--region-patch
                            "sample.txt" nil "-" (car sel) (cdr sel))))
               (should (memq 4 (cdr sel)))   ; new line 4 always selected
               (should patch)
@@ -275,15 +275,15 @@ side-by-side the row carries both sides, so the whole modification is staged."
 
 ;;;; Integration: whole-chunk staging --------------------------------------
 
-(ert-deftest difftastic-status-integration/chunk-patch-stages-whole-chunk ()
+(ert-deftest magit-difftastic-integration/chunk-patch-stages-whole-chunk ()
   "`--chunk-patch' (no region) stages every change the chunk covers."
   (skip-unless dst-test--have-tools)
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
       `(("sample.txt" . ,dst-test--new))
     (let* ((value (list :file "sample.txt" :index 0 :staged nil
-                        :diff-args difftastic-status--diff-base))
+                        :diff-args magit-difftastic--diff-base))
            (sec (dst-test--make-section 1 1 1 value))
-           (patch (difftastic-status--chunk-patch sec)))
+           (patch (magit-difftastic--chunk-patch sec)))
       (should patch)
       (with-temp-buffer
         (insert patch)
@@ -297,16 +297,16 @@ side-by-side the row carries both sides, so the whole modification is staged."
 
 ;;;; Integration: line-number hiding ---------------------------------------
 
-(ert-deftest difftastic-status-integration/hide-line-numbers ()
+(ert-deftest magit-difftastic-integration/hide-line-numbers ()
   "Hiding blanks the gutter via a `display' property but keeps text and staging."
   (skip-unless dst-test--have-tools)
   (skip-unless (fboundp 'difftastic--classify-chunk))
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
       `(("sample.txt" . ,dst-test--new))
-    (let ((difftastic-status-display "side-by-side-show-both"))
+    (let ((magit-difftastic-display "side-by-side-show-both"))
      (with-temp-buffer
       (insert (dst-test--chunk-buffer-string "sample.txt" "side-by-side-show-both"))
-      (difftastic-status--hide-line-numbers (point-min) (point-max))
+      (magit-difftastic--hide-line-numbers (point-min) (point-max))
       ;; The first body row's leading digit is visually blanked, text intact.
       (goto-char (point-min))
       (forward-line 1)
@@ -324,13 +324,13 @@ side-by-side the row carries both sides, so the whole modification is staged."
         (goto-char (point-min))
         (search-forward "delta-modified")
         (dst-test--with-region (line-beginning-position) (line-end-position)
-          (let ((sel (difftastic-status--region-selected-lines sec)))
+          (let ((sel (magit-difftastic--region-selected-lines sec)))
             (should (memq 4 (car sel)))
             (should (memq 4 (cdr sel))))))))))
 
 ;;;; Integration: file statuses --------------------------------------------
 
-(ert-deftest difftastic-status-integration/file-statuses ()
+(ert-deftest magit-difftastic-integration/file-statuses ()
   "`--file-statuses' reports Magit's status words for each change kind."
   (skip-unless dst-test--have-tools)
   (dst-test--with-repo '(("keep.txt" . "x\n")
@@ -338,8 +338,8 @@ side-by-side the row carries both sides, so the whole modification is staged."
       '(("keep.txt" . "x\nmore\n")
         ("fresh.txt" . "brand new\n"))
     (delete-file "gone.txt")
-    (let* ((statuses (difftastic-status--file-statuses
-                      difftastic-status--diff-base)))
+    (let* ((statuses (magit-difftastic--file-statuses
+                      magit-difftastic--diff-base)))
       (should (equal (car (cdr (assoc "keep.txt" statuses))) "modified"))
       (should (equal (car (cdr (assoc "gone.txt" statuses))) "deleted"))
       ;; A brand new file is untracked, so it is not part of the tracked diff.
@@ -347,10 +347,10 @@ side-by-side the row carries both sides, so the whole modification is staged."
 
 ;;;; Unit tests: major-mode detection -------------------------------------
 
-(ert-deftest difftastic-status--mode-for-file/recognizes-and-rejects ()
-  (let ((mode (difftastic-status--mode-for-file "foo.el")))
+(ert-deftest magit-difftastic--mode-for-file/recognizes-and-rejects ()
+  (let ((mode (magit-difftastic--mode-for-file "foo.el")))
     (should (and mode (fboundp mode))))
-  (should-not (difftastic-status--mode-for-file "foo.no-such-ext-zzz")))
+  (should-not (magit-difftastic--mode-for-file "foo.no-such-ext-zzz")))
 
 ;;;; Integration: syntax highlighting --------------------------------------
 
@@ -370,18 +370,18 @@ difft and our syntax highlighting both colour via `font-lock-face'."
                                 (point) 'font-lock-face)
                                (point-max))))))
 
-(ert-deftest difftastic-status-integration/syntax-highlight-applies-faces ()
+(ert-deftest magit-difftastic-integration/syntax-highlight-applies-faces ()
   "Major-mode font-lock faces are layered onto code in every layout."
   (skip-unless dst-test--have-tools)
   (dolist (display dst-test--displays)
     (dst-test--with-repo
         '(("sample.el" . "(defun greet (name)\n  (message \"hi %s\" name))\n"))
         '(("sample.el" . "(defun greet (name greeting)\n  ;; say hi\n  (message \"%s %s\" greeting name))\n"))
-      (let ((difftastic-status-display display))
+      (let ((magit-difftastic-display display))
        (with-temp-buffer
         (insert (dst-test--chunk-buffer-string "sample.el" display))
-        (difftastic-status--apply-syntax "sample.el" (point-min) (point-max)
-                                         (difftastic-status--context-unstaged))
+        (magit-difftastic--apply-syntax "sample.el" (point-min) (point-max)
+                                         (magit-difftastic--context-unstaged))
         ;; `defun' is fontified as a keyword ...
         (goto-char (point-min))
         (should (search-forward "defun" nil t))
@@ -390,7 +390,7 @@ difft and our syntax highlighting both colour via `font-lock-face'."
         ;; ... and the added comment carries the comment face somewhere.
         (should (dst-test--face-present-p 'font-lock-comment-face)))))))
 
-(ert-deftest difftastic-status-integration/syntax-highlight-docstring-context ()
+(ert-deftest magit-difftastic-integration/syntax-highlight-docstring-context ()
   "A change inside a multi-line docstring is highlighted as a string/doc.
 Per-chunk reconstruction misses this (the opening quote is out of view); the
 whole-file fontification path recognizes the enclosing string."
@@ -399,27 +399,27 @@ whole-file fontification path recognizes the enclosing string."
     (dst-test--with-repo
         '(("d.el" . "(defun foo ()\n  \"Line one.\nLine two old.\nLine three.\"\n  1)\n"))
         '(("d.el" . "(defun foo ()\n  \"Line one.\nLine two NEW.\nLine three.\"\n  1)\n"))
-      (let ((difftastic-status-display display))
+      (let ((magit-difftastic-display display))
        (with-temp-buffer
         (insert (dst-test--chunk-buffer-string "d.el" display))
-        (difftastic-status--apply-syntax "d.el" (point-min) (point-max)
-                                         (difftastic-status--context-unstaged))
+        (magit-difftastic--apply-syntax "d.el" (point-min) (point-max)
+                                         (magit-difftastic--context-unstaged))
         (should (or (dst-test--face-present-p 'font-lock-doc-face)
                     (dst-test--face-present-p 'font-lock-string-face))))))))
 
-(ert-deftest difftastic-status-integration/syntax-highlight-noop-unknown-mode ()
+(ert-deftest magit-difftastic-integration/syntax-highlight-noop-unknown-mode ()
   "A file with no recognized major mode gets no font-lock faces."
   (skip-unless dst-test--have-tools)
   (dst-test--with-repo '(("data.no-such-ext-zzz" . "alpha\nbravo\n"))
       '(("data.no-such-ext-zzz" . "alpha\nBRAVO\ncharlie\n"))
-    (let ((difftastic-status-display "side-by-side-show-both"))
+    (let ((magit-difftastic-display "side-by-side-show-both"))
       (with-temp-buffer
         (insert (dst-test--chunk-buffer-string "data.no-such-ext-zzz"
                                                "side-by-side-show-both"))
-        (difftastic-status--apply-syntax "data.no-such-ext-zzz"
+        (magit-difftastic--apply-syntax "data.no-such-ext-zzz"
                                          (point-min) (point-max)
-                                         (difftastic-status--context-unstaged))
+                                         (magit-difftastic--context-unstaged))
         (should-not (dst-test--face-present-p 'font-lock-keyword-face))))))
 
-(provide 'difftastic-status-test)
-;;; difftastic-status-test.el ends here
+(provide 'magit-difftastic-test)
+;;; magit-difftastic-test.el ends here

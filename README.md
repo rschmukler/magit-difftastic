@@ -1,76 +1,58 @@
-# difftastic-status
+# magit-difftastic
 
-[![CI](https://github.com/rschmukler/difftastic-status/actions/workflows/ci.yml/badge.svg)](https://github.com/rschmukler/difftastic-status/actions/workflows/ci.yml)
+[![CI](https://github.com/rschmukler/magit-difftastic/actions/workflows/ci.yml/badge.svg)](https://github.com/rschmukler/magit-difftastic/actions/workflows/ci.yml)
 
-Render unstaged/staged changes in the `magit-status` buffer using
-[difftastic](https://github.com/Wilfred/difftastic), while keeping them as
-collapsible, navigable Magit sections with full staging support.
+Render diffs with [difftastic](https://github.com/Wilfred/difftastic) *inside*
+Magit's own buffers (`magit-status`, `magit-diff-mode`, `magit-revision-mode`),
+as collapsible, navigable Magit sections with full staging support. Builds on,
+and complements, [difftastic.el][difftastic-el].
 
-`difftastic-status` builds on top of [difftastic.el][difftastic-el]. Where
-difftastic.el gives you beautiful, syntax-aware diffs in dedicated buffers,
-`difftastic-status` brings that rendering *into* `magit-status` itself — and
-keeps everything you expect from Magit: collapsible sections, navigation, and
-stage / unstage / discard at the file, chunk, **and** line-range level.
 
 ## What it looks like
 
-Each changed file becomes a Magit `file` section. Its body is the
-difftastic-rendered diff, split on difftastic's own `FILE --- N/M --- LANG`
-chunk headers into collapsible per-chunk sub-sections with a minimal,
-native-looking `@@ line N @@` heading.
+Each changed file is a Magit `file` section; its body is the difftastic diff,
+split into collapsible per-chunk sub-sections with a native-looking
+`@@ line N @@` heading.
 
-```
-Unstaged changes (2)
-  src/app.clj
-    @@ line 12 @@
-      12 (defn handler ...        ; difftastic-rendered, syntax-highlighted
-    @@ line 40 @@
-      ...
-  README.md
-    @@ line 3 @@
-      ...
-```
+<img width="3366" height="1728" alt="image" src="https://github.com/user-attachments/assets/0dfc46ea-d638-4802-9290-670ab729a609" />
 
 ## Features
 
-- **Difftastic rendering inside `magit-status`** — unstaged and staged
-  sections are replaced with difftastic output, using difftastic's own colour
-  vectors so it matches `difftastic-magit-diff`.
-- **Inline or side-by-side**, with optional Emacs major-mode **syntax
-  highlighting** layered on top (difft only emphasizes keywords/comments) and
-  optional hiding of the line-number gutters — see
-  `difftastic-status-display`, `difftastic-status-syntax-highlight` and
-  `difftastic-status-line-numbers`.
-- **Collapsible, navigable sections** — files and chunks are real Magit
-  sections, so `TAB`, section motion, etc. all work.
-- **Multi-level staging** that maps difftastic's display back onto real git
-  hunks (so every applied patch is a valid git patch):
-  - **File level** — `s` / `u` on a file heading stage / unstage the whole file.
-  - **Chunk level** — `s` / `u` / `k` on a chunk act on just that chunk.
-  - **Line-range level** — with an active region inside a chunk, the same keys
-    act on only the selected lines.
-- **Beyond `magit-status`** — the same difftastic chunks also render in
-  `magit-diff-mode` buffers (including the diff Magit shows while you compose a
-  commit message) and in `magit-revision-mode` (viewing a commit). Per-chunk /
-  line-range staging stays available where it is meaningful — the worktree
-  (unstaged) and `--cached` (staged) diffs — while diffs that merely compare two
-  revisions (a range diff, or a commit being viewed) are rendered display-only.
-  Anything difftastic can't render (`--no-index` diffs, merge commits shown as a
-  combined diff) falls straight back to Magit's stock rendering.
-- **Per-file rendering toggle** — with point on a file (or chunk),
-  `difftastic-status-toggle-file-rendering` (`C-c C-d` by default) switches just
-  that file between difftastic and stock Magit rendering, and back. A
-  stock-rendered file uses Magit's own per-hunk / per-line staging — handy for
-  fine-grained staging or a file difftastic renders awkwardly. The choice is
-  buffer-local and survives refreshes.
-- **Toggleable** — `difftastic-status-mode` is a global minor mode. Turn it off
-  and Magit's stock unstaged/staged sections come right back, so you always
-  have a fallback. The diff- and revision-buffer integrations can be scoped
-  independently with `difftastic-status-diff-buffers` and
-  `difftastic-status-revision-buffers`.
-- **Optional, graceful Evil integration** — if [Evil][evil] is present the
-  staging keys are bound in the relevant magit maps; if not, nothing is
-  assumed and the package works with stock Emacs keybindings.
+- **In-place difftastic rendering** — replaces Magit's diff sections, using
+  difftastic's colour vectors so it matches `difftastic-magit-diff`.
+- **Multi-level staging** — `s` / `u` / `k` work on the whole **file**, a single
+  **chunk**, or just the **selected lines**, mapped back onto real git hunks so
+  every applied patch is valid.
+- **Real Magit sections** — files and chunks are genuine sections, so `TAB`,
+  navigation, and the rest of Magit work as usual.
+- **Works beyond `magit-status`** — also renders in `magit-diff-mode` (including
+  the commit-message preview) and `magit-revision-mode`; staging stays available
+  on the worktree and `--cached` diffs, with revision-only diffs shown
+  display-only. Anything difftastic can't render falls back to stock Magit.
+- **Per-file toggle** — `magit-difftastic-toggle-file-rendering` (`C-c C-d`)
+  switches a single file between difftastic and stock Magit rendering (the
+  latter giving Magit's own per-line staging); buffer-local and refresh-safe.
+- **Configurable display** — inline or side-by-side, optional major-mode syntax
+  highlighting, optional line-number gutters.
+- **Drop-in and reversible** — `magit-difftastic-mode` is a global minor mode;
+  turn it off and stock Magit returns.
+- **Optional Evil integration** — staging keys are bound in the magit maps when
+  [Evil][evil] is present, and skipped entirely when it isn't.
+
+## How this differs from difftastic.el
+
+[difftastic.el][difftastic-el] also integrates difftastic with Magit, via the
+`difftastic-magit-diff` / `difftastic-magit-show` commands. Those render into a
+**dedicated, read-only buffer** — great for *viewing* a structural diff, but
+with no Magit sections and no staging.
+
+`magit-difftastic` instead renders *in place* in Magit's own buffers, as real
+sections you can **stage at the file, chunk, or line level**. It's a drop-in
+minor mode (not commands you invoke), and reuses difftastic.el under the hood
+for rendering and colours.
+
+In short: use **difftastic.el** to *view* a diff in its own buffer; use
+**`magit-difftastic`** to *review and stage* changes without leaving Magit.
 
 ## Requirements
 
@@ -87,17 +69,17 @@ Unstaged changes (2)
 In `packages.el`:
 
 ```elisp
-(package! difftastic-status
-  :recipe (:host github :repo "rschmukler/difftastic-status"))
+(package! magit-difftastic
+  :recipe (:host github :repo "rschmukler/magit-difftastic"))
 ```
 
 In `config.el`:
 
 ```elisp
-(use-package! difftastic-status
+(use-package! magit-difftastic
   :after magit
   :config
-  (difftastic-status-mode +1))
+  (magit-difftastic-mode +1))
 ```
 
 Then run `doom sync`.
@@ -105,11 +87,11 @@ Then run `doom sync`.
 ### `straight.el` + `use-package`
 
 ```elisp
-(use-package difftastic-status
-  :straight (:host github :repo "rschmukler/difftastic-status")
+(use-package magit-difftastic
+  :straight (:host github :repo "rschmukler/magit-difftastic")
   :after magit
   :config
-  (difftastic-status-mode +1))
+  (magit-difftastic-mode +1))
 ```
 
 ### Manual
@@ -117,20 +99,19 @@ Then run `doom sync`.
 Clone the repo, put it on your `load-path`, and:
 
 ```elisp
-(require 'difftastic-status)
+(require 'magit-difftastic)
 (with-eval-after-load 'magit
-  (difftastic-status-mode +1))
+  (magit-difftastic-mode +1))
 ```
 
-> **Note:** the package does **not** enable itself on load. Enabling
-> `difftastic-status-mode` is left to you (see above), so installing the
-> package never changes your `magit-status` behaviour until you opt in.
+> **Note:** the package does **not** enable itself on load — enabling
+> `magit-difftastic-mode` is left to you, so installing it never changes Magit
+> until you opt in.
 
 ## Usage
 
-Enable the mode with `M-x difftastic-status-mode` (or via your config). It is a
-global minor mode; toggling it refreshes any visible `magit-status` buffers
-immediately. While it is on:
+Enable the mode with `M-x magit-difftastic-mode` (or via your config); toggling
+it refreshes visible Magit buffers immediately. While it is on:
 
 | Key   | On a file heading        | On a chunk (or selected region)          |
 |-------|--------------------------|------------------------------------------|
@@ -140,47 +121,43 @@ immediately. While it is on:
 | `TAB` | collapse / expand file   | collapse / expand the chunk              |
 | `RET` | visit the file           | visit the file at the chunk's change     |
 
-These are the standard Magit keys — `difftastic-status` advises Magit's
-`magit-stage` / `magit-unstage` / `magit-discard` / `magit-visit-thing`
-commands so that, while point is on a difftastic chunk, they operate on that
-chunk; otherwise they behave exactly as usual.
+These are the standard Magit keys: `magit-difftastic` advises `magit-stage` /
+`magit-unstage` / `magit-discard` / `magit-visit-thing` so that, on a difftastic
+chunk, they act on that chunk — otherwise they behave as usual.
 
-The following interactive commands are also available for direct binding or
-`M-x`:
+These interactive commands are also available for direct binding or `M-x`:
 
-- `difftastic-status-stage-chunk`
-- `difftastic-status-unstage-chunk`
-- `difftastic-status-discard-chunk`
-- `difftastic-status-visit-file-dwim`
+- `magit-difftastic-stage-chunk`
+- `magit-difftastic-unstage-chunk`
+- `magit-difftastic-discard-chunk`
+- `magit-difftastic-visit-file-dwim`
 
 ### Evil integration
 
 If Evil is loaded when the mode is enabled, `s` / `u` / `x` are bound in
-`magit-mode-map` and `magit-section-mode-map` for both normal and visual
-states, so chunk staging and region (line-range) staging behave identically
-and predictably under `evil-collection-magit`. If Evil is not present, this
-step is skipped entirely — no hard dependency, nothing assumed.
+`magit-mode-map` and `magit-section-mode-map` (normal and visual states) so
+chunk and region staging behave predictably under `evil-collection-magit`. If
+Evil is absent, this is skipped entirely — no hard dependency.
 
 ## Configuration
 
 | Variable                                 | Default      | Description                                                                 |
 |------------------------------------------|--------------|-----------------------------------------------------------------------------|
-| `difftastic-status-display`              | `"side-by-side"` | Layout passed to `difft --display`: `"inline"`, `"side-by-side"`, or `"side-by-side-show-both"`. All support per-chunk and line-range staging. |
-| `difftastic-status-line-numbers`         | `t`          | Whether difft's per-line number gutters are shown. When `nil` they are hidden; staging works the same either way. |
-| `difftastic-status-syntax-highlight`     | `t`          | Layer the file's Emacs major-mode font-lock faces onto each chunk's code (difft only emphasizes keywords/comments). Diff colors keep precedence. Adds per-file fontification cost; set `nil` to disable. |
-| `difftastic-status-width`                | `window`     | Column width passed to difft, controlling where it wraps long lines: `window` (fit the window) or an integer (fixed columns; larger wraps less). |
-| `difftastic-status-min-width`            | `40`         | Minimum column width requested from difft. |
-| `difftastic-status-chunk-heading-face`   | `magit-diff-hunk-heading` | Face for the per-chunk `@@ line N @@` headings. Defaults to Magit's hunk-heading face (a full-width bar); set to e.g. `magit-hash` for understated headings. |
-| `difftastic-status-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
-| `difftastic-status-diff-buffers`         | `t`          | Render `magit-diff-mode` buffers (including the commit-message preview) with difftastic chunks. |
-| `difftastic-status-revision-buffers`     | `t`          | Render `magit-revision-mode` buffers (viewing a commit) with difftastic chunks. |
-| `difftastic-status-toggle-rendering-key` | `"C-c C-d"`  | Key bound on difftastic/stock sections to `difftastic-status-toggle-file-rendering` (switch the file at point between difftastic and stock Magit rendering). `nil` binds no key. |
+| `magit-difftastic-display`              | `"side-by-side"` | Layout passed to `difft --display`: `"inline"`, `"side-by-side"`, or `"side-by-side-show-both"`. All support per-chunk and line-range staging. |
+| `magit-difftastic-line-numbers`         | `t`          | Whether difft's per-line number gutters are shown. When `nil` they are hidden; staging works the same either way. |
+| `magit-difftastic-syntax-highlight`     | `t`          | Layer the file's Emacs major-mode font-lock faces onto each chunk's code (difft only emphasizes keywords/comments). Diff colors keep precedence. Adds per-file fontification cost; set `nil` to disable. |
+| `magit-difftastic-width`                | `window`     | Column width passed to difft, controlling where it wraps long lines: `window` (fit the window) or an integer (fixed columns; larger wraps less). |
+| `magit-difftastic-min-width`            | `40`         | Minimum column width requested from difft. |
+| `magit-difftastic-chunk-heading-face`   | `magit-diff-hunk-heading` | Face for the per-chunk `@@ line N @@` headings. Defaults to Magit's hunk-heading face (a full-width bar); set to e.g. `magit-hash` for understated headings. |
+| `magit-difftastic-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
+| `magit-difftastic-diff-buffers`         | `t`          | Render `magit-diff-mode` buffers (including the commit-message preview) with difftastic chunks. |
+| `magit-difftastic-revision-buffers`     | `t`          | Render `magit-revision-mode` buffers (viewing a commit) with difftastic chunks. |
+| `magit-difftastic-toggle-rendering-key` | `"C-c C-d"`  | Key bound on difftastic/stock sections to `magit-difftastic-toggle-file-rendering` (switch the file at point between difftastic and stock Magit rendering). `nil` binds no key. |
 
 ## How it works
 
-difftastic is used for **display only**. Git's own unified diff stays the
-source of truth for any patch that gets applied, so every applied patch is a
-valid git patch:
+difftastic is used for **display only** — git's own unified diff stays the
+source of truth for every applied patch:
 
 1. read the chunk's `(file, index, staged)` from the section value;
 2. lazily run `difft --display json` for that file to get the chunk's exact
@@ -190,43 +167,37 @@ valid git patch:
    transforms the hunk the same way `magit-diff-hunk-region-patch` does);
 5. apply that mini-patch with `git apply [--cached] [--reverse]`.
 
-Chunk sub-sections use a custom `difftastic-hunk` section type (deliberately
-*not* Magit's real `hunk` type, which would repaint lines and clobber
-difftastic's colours). Because that custom type is not one Magit's apply
-machinery understands — and because `evil-collection-magit` makes
-`magit-mode-map` an overriding map — per-chunk commands are wired by *advising*
-the magit commands, which is binding- and evil-state-agnostic.
+Chunk sub-sections use a custom `magit-difftastic-hunk` section type (not
+Magit's real `hunk` type, which would repaint lines and clobber difftastic's
+colours). Since Magit's apply machinery doesn't understand that type, per-chunk
+commands are wired by *advising* the magit commands — binding- and
+evil-state-agnostic.
 
 ## Known limitations
 
-- Region staging operates within a single chunk at a time. A region spanning
-  multiple chunks/files only affects the chunk that contains it. Whole-chunk
-  staging snaps to the underlying git-hunk boundary — the same boundary
-  Magit's own per-hunk staging uses.
-- `difft` is run synchronously, once per changed file, on every status refresh
-  (plus one extra `difft --display json` per staging action). On large change
-  sets this can make `magit-status` sluggish. The same cost applies to the
-  difftastic-rendered diff and revision buffers.
-- Untracked files are still rendered by the stock
-  `magit-insert-untracked-files`.
-- In `magit-diff-mode` / `magit-revision-mode` buffers the difftastic rendering
-  replaces Magit's diff section wholesale, so the usual diffstat header is not
-  shown there. Merge commits (shown as a combined diff) and `--no-index` diffs
-  are left to Magit's stock rendering.
+- Region staging operates within a single chunk; whole-chunk staging snaps to
+  the underlying git-hunk boundary (the same one Magit's per-hunk staging uses).
+- `difft` runs synchronously, once per changed file, on every refresh (plus one
+  `difft --display json` per staging action), so large change sets can feel
+  sluggish.
+- Untracked files use the stock `magit-insert-untracked-files`.
+- In `magit-diff-mode` / `magit-revision-mode`, difftastic replaces Magit's diff
+  section wholesale, so the diffstat header isn't shown. Merge commits and
+  `--no-index` diffs fall back to stock Magit.
 
 ## Testing
 
-The test suite ([`test/difftastic-status-test.el`](./test/difftastic-status-test.el))
+The test suite ([`test/magit-difftastic-test.el`](./test/magit-difftastic-test.el))
 uses ERT and is run with [Eldev][eldev]:
 
 ```sh
 eldev test
 ```
 
-It mixes fast unit tests for the pure helpers with integration tests that drive
-the real rendering and staging pipeline against a throwaway git repository. The
-integration tests need `difft` and `git` on `PATH` and are skipped
-automatically when either is missing.
+It mixes fast unit tests with integration tests that drive the real rendering
+and staging pipeline against a throwaway git repo. The integration tests need
+`difft` and `git` on `PATH`, and are skipped automatically when either is
+missing.
 
 ## License
 
