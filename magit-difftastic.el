@@ -170,8 +170,12 @@ fontified with the file's Emacs major mode, so keywords, strings, types, etc.
 get their usual faces.  The diff colours difft applies to changed tokens keep
 precedence.
 
-This re-fontifies each rendered file with its major mode, which adds some cost
-on top of difft itself; set to nil to turn it off."
+This fontifies each rendered file with its major mode, which adds some cost on
+top of difft itself.  The cost is contained: only the lines a chunk displays are
+fontified (font-lock still scans from the start for correct context), and the
+result is cached per blob across refreshes -- and shared between the staged and
+unstaged views -- alongside the render cache (see `magit-difftastic-cache' and
+`magit-difftastic-clear-cache').  Set to nil to turn it off."
   :type 'boolean
   :group 'magit-difftastic)
 
@@ -360,30 +364,71 @@ full old/new blob object ids cheaply."
                   diff-args)
           '("--raw" "--no-abbrev")))
 
+(defun magit-difftastic--status-word (code)
+  "Return Magit's status word for raw status letter CODE (a character).
+\"new file\" for additions/copies, \"deleted\", \"renamed\", else \"modified\"
+\(matching what Magit's own porcelain `--name-status' reports)."
+  (pcase code
+    (?A "new file")
+    (?D "deleted")
+    (?C "new file")
+    (?R "renamed")
+    (_  "modified")))
+
+(defun magit-difftastic--raw-info (diff-args &optional files)
+  "Return a hash of NEW-PATH -> plist for the DIFF-ARGS diff.
+Runs a single `git ... --raw' plumbing call (see `magit-difftastic--raw-args');
+when FILES is non-nil it is appended as a pathspec, otherwise every changed file
+is reported.  Each value is a plist with:
+  :old     the old blob object id;
+  :new     the new blob object id (an all-zero placeholder for a worktree side
+           git has not hashed -- callers fold the worktree file's stat into the
+           cache key for those);
+  :status  Magit's status word (see `magit-difftastic--status-word');
+  :orig    the source path for a rename/copy, else nil.
+A rename/copy entry is keyed on the NEW path (matching how files are rendered).
+
+This is the single plumbing pass both the render/syntax caches (via the blob
+ids) and the file headings (via the status word) read from, so a refresh runs it
+once instead of a separate `--raw' and `--name-status' call."
+  (let ((map (make-hash-table :test 'equal)))
+    (with-temp-buffer
+      (apply #'process-file "git" nil t nil
+             (append (magit-difftastic--raw-args diff-args)
+                     (when files (cons "--" files))))
+      (dolist (line (split-string (buffer-string) "\n" t))
+        ;; A raw line is ":OMODE NMODE OID NID STATUS\tPATH" (rename/copy:
+        ;; "...\tOLD\tNEW").  Combined (merge) diffs start with "::" and are
+        ;; not rendered by us, so they are ignored here.
+        (when (and (string-prefix-p ":" line)
+                   (not (string-prefix-p "::" line)))
+          (when-let* ((tab (string-search "\t" line))
+                      (meta (split-string (substring line 0 tab) " " t))
+                      (paths (split-string (substring line (1+ tab)) "\t"))
+                      (oid (nth 2 meta))
+                      (nid (nth 3 meta))
+                      (status (nth 4 meta))
+                      (path (car (last paths))))
+            (let ((code (aref status 0)))
+              (puthash path
+                       (list :old oid :new nid
+                             :status (magit-difftastic--status-word code)
+                             ;; The OLD path of a rename/copy (raw lists it as
+                             ;; the first of the two tab-separated paths).
+                             :orig (and (memq code '(?C ?R)) (car paths)))
+                       map))))))
+    map))
+
 (defun magit-difftastic--blob-ids (diff-args files)
   "Return a hash of FILE -> (OLD-ID . NEW-ID) for the DIFF-ARGS diff of FILES.
-Runs a single `git ... --raw' plumbing call (see `magit-difftastic--raw-args').
-A worktree side git has not hashed is reported as an all-zero NEW-ID; callers
-fold the worktree file's stat into the cache key for those.  A rename's entry is
-keyed on the NEW path (matching how files are rendered)."
+A thin projection of `magit-difftastic--raw-info' (which see); a rename's entry
+is keyed on the NEW path."
   (let ((map (make-hash-table :test 'equal)))
     (when files
-      (with-temp-buffer
-        (apply #'process-file "git" nil t nil
-               (append (magit-difftastic--raw-args diff-args) '("--") files))
-        (dolist (line (split-string (buffer-string) "\n" t))
-          ;; A raw line is ":OMODE NMODE OID NID STATUS\tPATH" (rename/copy:
-          ;; "...\tOLD\tNEW").  Combined (merge) diffs start with "::" and are
-          ;; not rendered by us, so they are ignored here.
-          (when (and (string-prefix-p ":" line)
-                     (not (string-prefix-p "::" line)))
-            (when-let* ((tab (string-search "\t" line))
-                        (meta (split-string (substring line 0 tab) " " t))
-                        (paths (split-string (substring line (1+ tab)) "\t"))
-                        (oid (nth 2 meta))
-                        (nid (nth 3 meta))
-                        (path (car (last paths))))
-              (puthash path (cons oid nid) map))))))
+      (maphash (lambda (path info)
+                 (puthash path (cons (plist-get info :old) (plist-get info :new))
+                          map))
+               (magit-difftastic--raw-info diff-args files)))
     map))
 
 (defcustom magit-difftastic-cache t
@@ -406,10 +451,18 @@ never stale.")
 Maps a content-identity key (see `magit-difftastic--cache-key') to the
 propertized difft string.  Bounded by `magit-difftastic--cache-max'.")
 
+;; Forward declaration: the fontification cache is defined with the syntax
+;; highlighting code further down, but `magit-difftastic-clear-cache' (here,
+;; alongside the render cache) clears it too.
+(defvar magit-difftastic--syntax-cache)
+
 (defun magit-difftastic-clear-cache ()
-  "Empty the difftastic render cache (`magit-difftastic--cache')."
+  "Empty the difftastic render and fontification caches.
+Clears both `magit-difftastic--cache' (rendered difft output) and
+`magit-difftastic--syntax-cache' (major-mode fontification)."
   (interactive)
   (clrhash magit-difftastic--cache)
+  (clrhash magit-difftastic--syntax-cache)
   (when (called-interactively-p 'interactive)
     (message "magit-difftastic render cache cleared")))
 
@@ -795,14 +848,33 @@ when difftastic's parser is unavailable."
 ;; Because the reconstructed text is built from the same spans we paint, the
 ;; mapping is exact -- no fuzzy column alignment is needed.
 
+(defun magit-difftastic--remap-mode (mode)
+  "Return MODE remapped per the user's major-mode remapping, or MODE.
+Applies `major-mode-remap-alist'/`major-mode-remap-defaults' exactly as
+`set-auto-mode' does, so a tree-sitter (`*-ts-mode') -- or any other replacement
+the user has opted into -- is used where it would be when visiting the file.  A
+no-op on Emacs versions without the remap machinery."
+  (cond
+   ((null mode) nil)
+   ;; Emacs 30.1+: the canonical resolver, also consults `*-remap-defaults'.
+   ((fboundp 'major-mode-remap) (major-mode-remap mode))
+   ;; Emacs 29: only the user alist exists; a nil value means \"no remap\".
+   ((and (boundp 'major-mode-remap-alist)
+         (assq mode major-mode-remap-alist))
+    (or (cdr (assq mode major-mode-remap-alist)) mode))
+   (t mode)))
+
 (defun magit-difftastic--mode-for-file (file)
   "Return the major-mode function Emacs would use for FILE, or nil.
-Only a callable mode symbol is returned; `fundamental-mode' and non-symbol
-entries yield nil (nothing to highlight)."
+The raw `auto-mode-alist' match is run through `magit-difftastic--remap-mode',
+so a configured tree-sitter (`*-ts-mode') mode is picked up just as it would be
+when visiting FILE.  Only a callable mode symbol is returned; `fundamental-mode'
+and non-symbol entries yield nil (nothing to highlight)."
   (let ((mode (let ((case-fold-search (memq system-type
                                             '(windows-nt cygwin darwin))))
                 (assoc-default file auto-mode-alist #'string-match))))
     (when (consp mode) (setq mode (car mode)))
+    (setq mode (magit-difftastic--remap-mode mode))
     (and mode (symbolp mode) (fboundp mode)
          (not (eq mode 'fundamental-mode))
          mode)))
@@ -975,15 +1047,41 @@ wrapped continuations) are joined into one logical source line."
 ;; Reconstructing a chunk's source from its displayed rows (above) loses the
 ;; surrounding context, so a change inside a multi-line construct -- most often
 ;; a docstring/string -- is not recognized as such and stays unhighlighted.  To
-;; fix that we fontify the WHOLE old/new file once (with full context) and map
-;; faces by line number.  The old/new content is fetched per the diff context's
-;; `:old-source'/`:new-source' specs ((worktree) or (blob REV)); when those are
-;; absent or fetching/fontifying fails we fall back to per-chunk reconstruction.
+;; fix that we fontify the old/new file with full preceding context and map
+;; faces by line number.  font-lock always scans from the start of the buffer,
+;; so it suffices to fontify only as far down as the lowest line the chunk
+;; displays (`magit-difftastic--source-vec' bounds it there) -- a tiny change in
+;; a huge file no longer fontifies the whole file.  The old/new content is
+;; fetched per the diff context's `:old-source'/`:new-source' specs ((worktree)
+;; or (blob REV)) and the fontified lines are cached per blob id across refreshes
+;; (`magit-difftastic--syntax-cache'); when no source is available, or fetching
+;; or fontifying fails, we fall back to per-chunk reconstruction.
 
-(defvar magit-difftastic--syntax-cache nil
-  "Dynamically-bound cache of fontified source vectors for one render.
-Bound to a fresh hash table in `magit-difftastic--insert-file-sections' so each
-changed file's old/new source is fetched and fontified at most once per refresh.")
+(defconst magit-difftastic--syntax-cache-max 2048
+  "Maximum number of entries kept in `magit-difftastic--syntax-cache'.
+When exceeded the cache is cleared wholesale; entries are keyed on immutable
+blob ids (or a worktree stat), so this only bounds memory -- a kept entry is
+never stale.")
+
+(defvar magit-difftastic--syntax-cache (make-hash-table :test 'equal)
+  "Persistent cache of fontified source lines, surviving across refreshes.
+Keyed on (MODE . CONTENT-ID) -- the major mode plus the side's git blob id
+\(or a worktree stat; see `magit-difftastic--side-content-id') -- so a blob's
+fontification is computed once and reused on every later refresh, and shared
+between the staged and unstaged views of the same blob.  Each value is
+\(COVERED . VEC): VEC is the 1-indexed line vector (see
+`magit-difftastic--fontify-lines') and COVERED the (LO . HI) line range actually
+fontified, so an entry is reused only when it covers the requested window (see
+`magit-difftastic--source-vec').  Bounded by
+`magit-difftastic--syntax-cache-max' and gated on `magit-difftastic-cache';
+cleared by `magit-difftastic-clear-cache'.")
+
+(defvar magit-difftastic--file-ids nil
+  "Dynamically-bound hash of FILE -> (OLD-ID . NEW-ID) for the current group.
+Bound in `magit-difftastic--insert-file-sections' from the single `--raw'
+plumbing pass (`magit-difftastic--raw-info'), so the syntax-highlight layer can
+content-key its fontification cache (`magit-difftastic--syntax-cache') by the
+same blob ids the render cache uses, instead of recomputing them.")
 
 (defun magit-difftastic--range-sources (range)
   "Return (OLD-SPEC . NEW-SPEC) source specs for a diff RANGE, or nil.
@@ -1013,28 +1111,108 @@ SPEC is (worktree) -- read from disk -- or (blob REV) -- `git show REV:FILE'
                                 (concat rev ":" file)))
             (buffer-string))))))
 
-(defun magit-difftastic--fontify-lines (mode text)
-  "Return a 1-indexed vector of MODE-fontified lines of TEXT, or nil.
-Element 0 is unused; element N is the propertized Nth line."
-  (when-let* ((fontified (magit-difftastic--fontify-string mode text)))
-    (let* ((lines (split-string fontified "\n"))
-           (vec (make-vector (1+ (length lines)) nil))
-           (i 0))
-      (dolist (l lines) (aset vec (setq i (1+ i)) l))
-      vec)))
+(defun magit-difftastic--fontify-lines (mode text &optional range)
+  "Return (COVERED . VEC) for TEXT fontified with major MODE, or nil.
+VEC is 1-indexed: element 0 is unused; element N is the propertized Nth line
+\(only the lines actually fontified carry faces).  COVERED is the (LO . HI) line
+range that was fontified.
 
-(defun magit-difftastic--source-vec (mode file spec)
-  "Return the fontified line vector for FILE's SPEC side, memoized per render."
-  (when spec
-    (let ((key (cons file spec)))
-      (if (and magit-difftastic--syntax-cache
-               (not (eq 'miss (gethash key magit-difftastic--syntax-cache 'miss))))
-          (gethash key magit-difftastic--syntax-cache)
-        (let ((vec (when-let* ((text (magit-difftastic--source-text file spec)))
-                     (magit-difftastic--fontify-lines mode text))))
-          (when magit-difftastic--syntax-cache
-            (puthash key vec magit-difftastic--syntax-cache))
-          vec)))))
+RANGE, when non-nil, is the (MIN . MAX) line window to fontify -- only those
+lines get the (expensive) face work, while font-lock still derives string and
+comment context from `syntax-ppss', which parses from the top of the buffer
+cheaply.  So a multi-line string/docstring opened above MIN is still recognized,
+but a tiny change deep in a huge file no longer fontifies everything above it.
+When RANGE is nil the whole buffer is fontified.  Returns nil on failure."
+  (condition-case nil
+      (with-temp-buffer
+        (insert text)
+        (let ((inhibit-message t)
+              (message-log-max nil))
+          (delay-mode-hooks (funcall mode))
+          (font-lock-mode 1)
+          (let* ((lo (max 1 (if range (car range) 1)))
+                 (hi (if range (cdr range)
+                       (count-lines (point-min) (point-max))))
+                 (beg (progn (goto-char (point-min))
+                             (forward-line (1- lo)) (point)))
+                 (end (progn (goto-char (point-min))
+                             (forward-line hi) (point))))
+            (font-lock-ensure beg end)
+            (let* ((segs (split-string (buffer-substring beg end) "\n"))
+                   ;; The region ends at a line start, so the split has a
+                   ;; trailing "" -- drop it so it is not stored as a line.
+                   (segs (if (and segs (string-empty-p (car (last segs))))
+                             (butlast segs)
+                           segs))
+                   (last (+ lo (length segs) -1))
+                   (vec (make-vector (1+ (max hi last 0)) nil))
+                   (i lo))
+              (dolist (s segs) (aset vec i s) (setq i (1+ i)))
+              (cons (cons lo (max last (1- lo))) vec)))))
+    (error nil)))
+
+(defun magit-difftastic--side-content-id (file id)
+  "Return the content identity for FILE's side blob ID, or nil.
+ID comes from `magit-difftastic--blob-ids'.  A concrete git oid is used
+directly; the all-zero placeholder (a worktree side git has not hashed) falls
+back to the file's stat so edits invalidate it; a nil ID (the blob ids are
+unavailable, e.g. outside a refresh) yields nil, so the side is fontified fresh
+and not cached -- never mis-keyed."
+  (cond
+   ((null id) nil)
+   ((magit-difftastic--all-zero-id-p id)
+    (when-let* ((st (magit-difftastic--worktree-stat file)))
+      (cons 'stat st)))
+   (t id)))
+
+(defun magit-difftastic--syntax-cache-put (key entry)
+  "Store ENTRY ((COVERED . VEC)) under KEY in the syntax cache."
+  (when (> (hash-table-count magit-difftastic--syntax-cache)
+           magit-difftastic--syntax-cache-max)
+    (clrhash magit-difftastic--syntax-cache))
+  (puthash key entry magit-difftastic--syntax-cache))
+
+(defun magit-difftastic--source-vec (mode file spec content-id range)
+  "Return the fontified line vector for FILE's SPEC side, content-keyed.
+SPEC is the source spec ((worktree) or (blob REV)) used to fetch the side's full
+text; CONTENT-ID is its content identity (`magit-difftastic--side-content-id').
+RANGE is the (MIN . MAX) line window the chunks display on this side; nil means
+nothing is shown on this side, so no source is fetched and nil is returned.
+
+When CONTENT-ID is non-nil and `magit-difftastic-cache' is on, the fontified
+vector is cached in `magit-difftastic--syntax-cache' keyed on
+\(MODE . CONTENT-ID), so it survives refreshes and is shared between the staged
+and unstaged views of the same blob.  Only RANGE's lines are fontified (see
+`magit-difftastic--fontify-lines'); a cached entry is reused when it already
+covers RANGE, otherwise the union of the cached and requested ranges is
+re-fontified and stored (so the covered window only grows)."
+  (when (and spec range)
+    (let* ((key (and content-id magit-difftastic-cache (cons mode content-id)))
+           (cached (and key (gethash key magit-difftastic--syntax-cache)))
+           (covered (car cached)))
+      (if (and covered (<= (car covered) (car range)) (>= (cdr covered) (cdr range)))
+          (cdr cached)
+        (let* ((want (if covered
+                         (cons (min (car covered) (car range))
+                               (max (cdr covered) (cdr range)))
+                       range))
+               (entry (when-let* ((text (magit-difftastic--source-text file spec)))
+                        (magit-difftastic--fontify-lines mode text want))))
+          (when (and key entry)
+            (magit-difftastic--syntax-cache-put key entry))
+          (and entry (cdr entry)))))))
+
+(defun magit-difftastic--entries-line-range (entries side)
+  "Return the (MIN . MAX) source line range among ENTRIES for SIDE, or nil.
+ENTRIES are (SIDE NUM CODE-BEG CODE-END) tuples (see
+`magit-difftastic--syntax-entries'); this is the line window that side's source
+must be fontified over to colour every row the chunks display."
+  (let (lo hi)
+    (pcase-dolist (`(,s ,num ,_cb ,_ce) entries)
+      (when (and (eq s side) (integerp num))
+        (when (or (null lo) (< num lo)) (setq lo num))
+        (when (or (null hi) (> num hi)) (setq hi num))))
+    (and lo (cons lo hi))))
 
 (defun magit-difftastic--copy-line-faces (srcline off n disp-beg)
   "Copy face runs from SRCLINE[OFF..OFF+N) onto DISP-BEG in this buffer."
@@ -1068,25 +1246,76 @@ tab expansion) is skipped rather than mis-highlighted."
                 (magit-difftastic--copy-line-faces srcline off n cb))
               (puthash okey (+ off len) offsets))))))))
 
+(defun magit-difftastic--source-vecs (mode file context old-range new-range)
+  "Return (OLD-VEC . NEW-VEC): FILE's sides fontified over OLD-RANGE/NEW-RANGE.
+Each RANGE is the (MIN . MAX) line window that side displays (nil to skip it).
+Each side is fetched per CONTEXT's `:old-source'/`:new-source' and content-keyed
+on its blob id (from `magit-difftastic--file-ids') so it is fontified once per
+blob and reused across refreshes (see `magit-difftastic--source-vec')."
+  (let ((ids (and magit-difftastic--file-ids
+                  (gethash file magit-difftastic--file-ids))))
+    (cons (magit-difftastic--source-vec
+           mode file (plist-get context :old-source)
+           (magit-difftastic--side-content-id file (car ids)) old-range)
+          (magit-difftastic--source-vec
+           mode file (plist-get context :new-source)
+           (magit-difftastic--side-content-id file (cdr ids)) new-range))))
+
+(defun magit-difftastic--apply-entries (mode entries old-vec new-vec)
+  "Paint ENTRIES from whole-file vectors OLD-VEC/NEW-VEC.
+Falls back to per-chunk reconstruction (limited context) when neither vector is
+available.  ENTRIES are (SIDE NUM CODE-BEG CODE-END) tuples for one chunk."
+  (when entries
+    (if (or old-vec new-vec)
+        (magit-difftastic--apply-syntax-full entries old-vec new-vec)
+      (dolist (side '(old new))
+        (when-let* ((side-entries (seq-filter (lambda (e) (eq (car e) side))
+                                              entries)))
+          (magit-difftastic--apply-syntax-side mode side-entries))))))
+
+(defun magit-difftastic--apply-syntax-sections (file context sections)
+  "Syntax-highlight every chunk in SECTIONS of FILE in one pass.
+Fetches and fontifies each blob ONCE -- bounded to the deepest line ANY of
+SECTIONS displays (font-lock still scans from the start for correct context) --
+then paints each section from those shared vectors, so a multi-chunk file costs
+one fontification per side rather than one per chunk.  The fontified lines are
+content-keyed on the blob id, so they survive refreshes and are shared between
+the staged and unstaged views.  No-op when FILE has no recognized major mode."
+  (when-let* ((mode (magit-difftastic--mode-for-file file))
+              (per-section
+               (delq nil
+                     (mapcar
+                      (lambda (s)
+                        (when-let* ((entries (magit-difftastic--syntax-entries
+                                              (oref s start) (oref s end))))
+                          (cons s entries)))
+                      sections))))
+    (let* ((all (apply #'append (mapcar #'cdr per-section)))
+           (vecs (magit-difftastic--source-vecs
+                  mode file context
+                  (magit-difftastic--entries-line-range all 'old)
+                  (magit-difftastic--entries-line-range all 'new))))
+      (pcase-dolist (`(,_s . ,entries) per-section)
+        (magit-difftastic--apply-entries mode entries (car vecs) (cdr vecs))))))
+
 (defun magit-difftastic--apply-syntax (file beg end context)
   "Add major-mode syntax highlighting to the chunk FILE between BEG and END.
-Uses whole-file fontification driven by CONTEXT's `:old-source'/`:new-source'
-\(correct context for strings/docstrings); falls back to per-chunk
-reconstruction when no source is available.  No-op when FILE has no recognized
-major mode."
+Fontifies the old/new source driven by CONTEXT's `:old-source'/`:new-source'
+\(correct context for strings/docstrings) only as far as the lines this chunk
+displays, content-keyed on the side's blob id so it is computed once per blob
+and reused across refreshes.  Falls back to per-chunk reconstruction when no
+source is available.  No-op when FILE has no recognized major mode.
+
+This highlights a single chunk; the section-insertion path uses
+`magit-difftastic--apply-syntax-sections' to highlight a whole file's chunks in
+one fontification pass."
   (when-let* ((mode (magit-difftastic--mode-for-file file))
               (entries (magit-difftastic--syntax-entries beg end)))
-    (let ((old-vec (magit-difftastic--source-vec
-                    mode file (plist-get context :old-source)))
-          (new-vec (magit-difftastic--source-vec
-                    mode file (plist-get context :new-source))))
-      (if (or old-vec new-vec)
-          (magit-difftastic--apply-syntax-full entries old-vec new-vec)
-        ;; Fallback: fontify each side's reconstructed snippet (limited context).
-        (dolist (side '(old new))
-          (when-let* ((side-entries (seq-filter (lambda (e) (eq (car e) side))
-                                                entries)))
-            (magit-difftastic--apply-syntax-side mode side-entries)))))))
+    (let ((vecs (magit-difftastic--source-vecs
+                 mode file context
+                 (magit-difftastic--entries-line-range entries 'old)
+                 (magit-difftastic--entries-line-range entries 'new))))
+      (magit-difftastic--apply-entries mode entries (car vecs) (cdr vecs)))))
 
 (defun magit-difftastic--region-selected-lines (section)
   "Return (OLD-LINES . NEW-LINES) selected by the active region within SECTION.
@@ -1392,8 +1621,9 @@ section displays even when difft's text display merges several JSON chunks."
                         'font-lock-face magit-difftastic-chunk-heading-face))
           (dolist (l body-lines)
             (insert l "\n"))
-          (when magit-difftastic-syntax-highlight
-            (magit-difftastic--apply-syntax file heading-start (point) context))
+          ;; Syntax highlighting is applied once per file (across all chunks) by
+          ;; `magit-difftastic--insert-chunks', so the file's source is fetched
+          ;; and fontified a single time rather than once per chunk.
           (unless magit-difftastic-line-numbers
             (magit-difftastic--hide-line-numbers heading-start (point))))))))
 
@@ -1405,48 +1635,49 @@ diff context plist threaded down to each chunk section."
   (let ((header-re (difftastic--chunk-regexp t))
         (lines (split-string rendered "\n"))
         (chunk nil)
-        (started nil))
+        (started nil)
+        (sections nil))
     (dolist (line lines)
       (if (string-match-p header-re line)
           (progn
             (when started
-              (magit-difftastic--insert-chunk (nreverse chunk) file context))
+              (push (magit-difftastic--insert-chunk (nreverse chunk) file context)
+                    sections))
             (setq chunk nil started t))
         (when started
           (push line chunk))))
     (when started
-      (magit-difftastic--insert-chunk (nreverse chunk) file context))))
+      (push (magit-difftastic--insert-chunk (nreverse chunk) file context)
+            sections))
+    ;; Highlight the whole file in one pass: fetch and fontify each blob a single
+    ;; time, bounded to the deepest line any chunk displays, then paint every
+    ;; chunk from those shared vectors (see `magit-difftastic--apply-syntax-sections').
+    (when magit-difftastic-syntax-highlight
+      (magit-difftastic--apply-syntax-sections
+       file context (delq nil (nreverse sections))))))
+
+(defun magit-difftastic--statuses-from-info (info)
+  "Project a `magit-difftastic--raw-info' hash INFO to a statuses alist.
+Each element is (PATH . (STATUS . ORIG)); see `magit-difftastic--file-statuses'."
+  (let (statuses)
+    (when info
+      (maphash (lambda (path i)
+                 (push (cons path (cons (plist-get i :status)
+                                        (plist-get i :orig)))
+                       statuses))
+               info))
+    statuses))
 
 (defun magit-difftastic--file-statuses (diff-args)
   "Return an alist of (PATH . (STATUS . ORIG)) for the DIFF-ARGS diff.
-DIFF-ARGS is the leading git invocation (see
-`magit-difftastic--file-diff-string'); `--name-status' is appended so each
-file's status can be read without rendering a diff.  STATUS is Magit's own
-status word (\"modified\", \"new file\", \"deleted\" or \"renamed\") and ORIG is
-the source path for a rename (else nil).  Used so our difftastic file headings
-mimic Magit's exactly, and to collapse deleted-file sections like Magit does."
-  (with-temp-buffer
-    (apply #'process-file "git" nil t nil
-           (append diff-args '("--name-status")))
-    (let (statuses)
-      (dolist (line (split-string (buffer-string) "\n" t))
-        ;; A status line is "<CODE>\t<PATH>", except rename/copy which is
-        ;; "<CODE>\t<OLD>\t<NEW>"; CODE's first letter is the change kind.
-        (let* ((fields (split-string line "\t"))
-               (code (car fields)))
-          (when (and code (> (length code) 0) (cadr fields))
-            (pcase (aref code 0)
-              (?A (push (cons (cadr fields) (cons "new file" nil)) statuses))
-              (?D (push (cons (cadr fields) (cons "deleted" nil)) statuses))
-              ;; Magit shows copies as "new file"; renames as "renamed".
-              (?C (when (nth 2 fields)
-                    (push (cons (nth 2 fields) (cons "new file" (cadr fields)))
-                          statuses)))
-              (?R (when (nth 2 fields)
-                    (push (cons (nth 2 fields) (cons "renamed" (cadr fields)))
-                          statuses)))
-              (_  (push (cons (cadr fields) (cons "modified" nil)) statuses))))))
-      statuses)))
+A projection of `magit-difftastic--raw-info' (which see), so the status word is
+read from the same `--raw' plumbing pass that resolves the blob ids rather than
+a separate `--name-status' call.  STATUS is Magit's own status word (\"modified\",
+\"new file\", \"deleted\" or \"renamed\") and ORIG is the source path for a
+rename (else nil).  Used so our difftastic file headings mimic Magit's exactly,
+and to collapse deleted-file sections like Magit does."
+  (magit-difftastic--statuses-from-info
+   (magit-difftastic--raw-info diff-args)))
 
 (defun magit-difftastic--file-heading (file status orig)
   "Return the heading string for FILE, mimicking Magit's `file' section heading.
@@ -1509,19 +1740,26 @@ is the default rendering; see `magit-difftastic--insert-file-sections'."
        (magit-difftastic--file-diff-string file diff-args)
        file context))))
 
-(defun magit-difftastic--prewarm (render-files context width)
+(defun magit-difftastic--prewarm (render-files context width &optional ids)
   "Return a FILE -> rendered-string hash for RENDER-FILES of CONTEXT at WIDTH.
 Files whose content is unchanged since an earlier refresh are served from the
 persistent cache (`magit-difftastic--cache'); the remaining files are rendered
 concurrently (`magit-difftastic--render-files') and then stored in that cache.
 Files that cannot be content-keyed (or when `magit-difftastic-cache' is nil) are
-simply rendered every time."
+simply rendered every time.
+
+IDS, when supplied, is the FILE -> (OLD-ID . NEW-ID) hash the caller already
+resolved (see `magit-difftastic--insert-file-sections'), reused so the blob ids
+are read only once per refresh; otherwise it is computed here with one `--raw'
+plumbing call."
   (let* ((diff-args (plist-get context :diff-args))
          (result (make-hash-table :test 'equal))
-         ;; One plumbing call resolves every file's old/new blob ids for keys.
+         ;; One plumbing call resolves every file's old/new blob ids for keys
+         ;; (reusing the caller's when provided).
          (ids (and magit-difftastic-cache
-                   (ignore-errors
-                     (magit-difftastic--blob-ids diff-args render-files))))
+                   (or ids
+                       (ignore-errors
+                         (magit-difftastic--blob-ids diff-args render-files)))))
          (keys (make-hash-table :test 'equal))
          (misses nil))
     (dolist (file render-files)
@@ -1567,15 +1805,18 @@ Initial visibility mirrors Magit: a file section starts collapsed in
 the diff/revision buffers.  The chunk sections are always inserted expanded, so
 expanding a file reveals its hunk(s) -- the same way a single-hunk file feels
 like it expands straight to its diff in Magit."
-  ;; Read each file's status once for the whole group (only the difftastic path
-  ;; needs it: for the Magit-matching heading and initial visibility).  A fresh
-  ;; syntax cache is bound for this group so each file's old/new source is
-  ;; fetched and fontified at most once across its chunks.
-  (let* ((statuses (and (cl-some (lambda (f)
-                                   (not (member f magit-difftastic--stock-files)))
-                                 files)
-                        (magit-difftastic--file-statuses
-                         (plist-get context :diff-args))))
+  ;; One `--raw' plumbing pass per group resolves, for every changed file: its
+  ;; status word/rename source (for the Magit-matching heading and initial
+  ;; visibility) AND its old/new blob ids -- which key BOTH the difft render
+  ;; cache (the pre-warm below) and the major-mode fontification cache (bound via
+  ;; `magit-difftastic--file-ids' so the syntax layer reuses these ids).  Doing
+  ;; this once folds away the old separate `--name-status' call.
+  (let* ((info (and (cl-some (lambda (f)
+                               (not (member f magit-difftastic--stock-files)))
+                             files)
+                    (ignore-errors
+                      (magit-difftastic--raw-info (plist-get context :diff-args)))))
+         (statuses (magit-difftastic--statuses-from-info info))
          ;; The porcelain `git diff' used for STATUSES detects renames and
          ;; reports each as a single "renamed: OLD -> NEW" entry.  FILES,
          ;; however, comes from plumbing (`git diff-index --name-only', via
@@ -1589,7 +1830,18 @@ like it expands straight to its diff in Magit."
                                          (and (equal (cadr s) "renamed")
                                               (cddr s)))
                                        statuses)))
-         (magit-difftastic--syntax-cache (make-hash-table :test 'equal))
+         ;; Blob ids (FILE -> (OLD-ID . NEW-ID)) shared with the render pre-warm
+         ;; and, via this dynamic binding, the fontification cache.
+         (ids (and info
+                   (let ((m (make-hash-table :test 'equal)))
+                     (maphash (lambda (p i)
+                                (puthash p (cons (plist-get i :old)
+                                                 (plist-get i :new))
+                                         m))
+                              info)
+                     m)))
+         (magit-difftastic--file-ids ids)
+         (width (magit-difftastic--width))
          ;; Pre-warm: resolve every difftastic-rendered file in this group up
          ;; front (stock-rendered files and rename sources are skipped -- the
          ;; former go through `magit--insert-diff', the latter are not shown).
@@ -1604,8 +1856,7 @@ like it expands straight to its diff in Magit."
                                   (member f rename-origins)))
                   files)))
             (when render-files
-              (magit-difftastic--prewarm
-               render-files context (magit-difftastic--width))))))
+              (magit-difftastic--prewarm render-files context width ids)))))
     (dolist (file files)
       (unless (member file rename-origins)
         (if (member file magit-difftastic--stock-files)

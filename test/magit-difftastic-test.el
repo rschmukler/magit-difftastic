@@ -539,6 +539,25 @@ and every requested file must be present in the returned hash."
       (should-not (magit-difftastic--all-zero-id-p (car pair)))
       (should-not (magit-difftastic--all-zero-id-p (cdr pair))))))
 
+(ert-deftest magit-difftastic-integration/raw-info-merges-ids-and-status ()
+  "`--raw-info' resolves blob ids AND the status word in one `--raw' pass.
+This is the single plumbing call that replaced the separate `--name-status'
+invocation, feeding both the caches (ids) and the file headings (status)."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("keep.txt" . "x\n")
+                         ("gone.txt" . "y\n"))
+      '(("keep.txt" . "x\nmore\n"))
+    (delete-file "gone.txt")
+    (let* ((info (magit-difftastic--raw-info magit-difftastic--diff-base))
+           (keep (gethash "keep.txt" info))
+           (gone (gethash "gone.txt" info)))
+      ;; A modified file: status word plus a real old id and an all-zero
+      ;; (unhashed worktree) new id -- both keys the caches need.
+      (should (equal (plist-get keep :status) "modified"))
+      (should-not (magit-difftastic--all-zero-id-p (plist-get keep :old)))
+      (should (magit-difftastic--all-zero-id-p (plist-get keep :new)))
+      (should (equal (plist-get gone :status) "deleted")))))
+
 (ert-deftest magit-difftastic-integration/cache-reuses-unchanged ()
   "A second pre-warm with unchanged content renders nothing and matches the first."
   (skip-unless dst-test--have-tools)
@@ -595,6 +614,18 @@ and every requested file must be present in the returned hash."
   (let ((mode (magit-difftastic--mode-for-file "foo.el")))
     (should (and mode (fboundp mode))))
   (should-not (magit-difftastic--mode-for-file "foo.no-such-ext-zzz")))
+
+(ert-deftest magit-difftastic--mode-for-file/honors-remap ()
+  "`--mode-for-file' follows `major-mode-remap-alist' (how `*-ts-mode' is chosen).
+We can't assume a tree-sitter grammar is installed, so this checks the same
+remap mechanism Emacs uses to swap in `*-ts-mode' with an ordinary mode."
+  (skip-unless (boundp 'major-mode-remap-alist))
+  (let* ((base (let ((major-mode-remap-alist nil))
+                 (magit-difftastic--mode-for-file "foo.el")))
+         (major-mode-remap-alist (list (cons base 'lisp-interaction-mode))))
+    (should base)
+    ;; The user's remap (here standing in for `foo-mode' -> `foo-ts-mode') wins.
+    (should (eq (magit-difftastic--mode-for-file "foo.el") 'lisp-interaction-mode))))
 
 ;;;; Integration: syntax highlighting --------------------------------------
 
@@ -664,6 +695,88 @@ whole-file fontification path recognizes the enclosing string."
                                          (point-min) (point-max)
                                          (magit-difftastic--context-unstaged))
         (should-not (dst-test--face-present-p 'font-lock-keyword-face))))))
+
+(ert-deftest magit-difftastic-integration/syntax-cache-reuses-fontification ()
+  "The fontification cache is content-keyed, so each blob is fontified once.
+With the blob ids bound (as a real refresh does via
+`magit-difftastic--file-ids'), re-running `--apply-syntax' for the same blobs
+reuses the cached lines instead of re-fontifying -- what makes a
+refresh-after-staging cheap and dedupes the index blob shared by the staged and
+unstaged views."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo
+      '(("sample.el" . "(defun greet (name)\n  (message \"hi %s\" name))\n"))
+      '(("sample.el" . "(defun greet (name greeting)\n  (message \"%s %s\" greeting name))\n"))
+    (let* ((magit-difftastic-cache t)
+           (display "side-by-side-show-both")
+           (magit-difftastic-display display)
+           (context (magit-difftastic--context-unstaged))
+           (magit-difftastic--file-ids
+            (magit-difftastic--blob-ids
+             (plist-get context :diff-args) '("sample.el")))
+           (calls 0))
+      (clrhash magit-difftastic--syntax-cache)
+      (cl-letf* ((orig (symbol-function 'magit-difftastic--fontify-lines))
+                 ((symbol-function 'magit-difftastic--fontify-lines)
+                  (lambda (&rest args) (cl-incf calls) (apply orig args))))
+        (with-temp-buffer
+          (insert (dst-test--chunk-buffer-string "sample.el" display))
+          (magit-difftastic--apply-syntax "sample.el" (point-min) (point-max)
+                                           context))
+        (should (> calls 0))
+        (let ((after-first calls))
+          ;; A second identical render is served entirely from the cache.
+          (with-temp-buffer
+            (insert (dst-test--chunk-buffer-string "sample.el" display))
+            (magit-difftastic--apply-syntax "sample.el" (point-min) (point-max)
+                                             context))
+          (should (= calls after-first)))))))
+
+(ert-deftest magit-difftastic-integration/apply-syntax-sections-one-pass ()
+  "`--apply-syntax-sections' highlights every chunk but fontifies each side once.
+A multi-chunk file (changes far apart) must cost one fontification per side for
+the whole file, not one per chunk -- the fix for the per-chunk re-fontification
+regression."
+  (skip-unless dst-test--have-tools)
+  (let* ((display "side-by-side-show-both")
+         (lines (lambda (a b)
+                  (concat (mapconcat
+                           (lambda (i)
+                             (format "(defun f%d () %d)"
+                                     i (cond ((= i 1) a) ((= i 20) b) (t i))))
+                           (number-sequence 1 20) "\n")
+                          "\n"))))
+    (dst-test--with-repo `(("m.el" . ,(funcall lines 1 20)))
+        `(("m.el" . ,(funcall lines 100 200)))
+      (let* ((magit-difftastic-display display)
+             (magit-difftastic-cache t)
+             (context (magit-difftastic--context-unstaged))
+             (magit-difftastic--file-ids
+              (magit-difftastic--blob-ids
+               (plist-get context :diff-args) '("m.el")))
+             (bodies (dst-test--display-chunk-bodies "m.el" display))
+             (calls 0))
+        ;; The change at line 1 and line 20 should render as separate chunks.
+        (skip-unless (> (length bodies) 1))
+        (clrhash magit-difftastic--syntax-cache)
+        (with-temp-buffer
+          (let (sections)
+            (dolist (body bodies)
+              (let ((beg (point)))
+                (insert "@@ line 1 @@\n")
+                (let ((content (point)))
+                  (insert body "\n")
+                  (push (dst-test--make-section beg content (point)) sections))))
+            (cl-letf* ((orig (symbol-function 'magit-difftastic--fontify-lines))
+                       ((symbol-function 'magit-difftastic--fontify-lines)
+                        (lambda (&rest args) (cl-incf calls) (apply orig args))))
+              (magit-difftastic--apply-syntax-sections
+               "m.el" context (nreverse sections))))
+          ;; One fontification per side (old + new) for the whole file, no matter
+          ;; how many chunks it split into.
+          (should (<= calls 2))
+          ;; And the highlighting actually landed.
+          (should (dst-test--face-present-p 'font-lock-keyword-face)))))))
 
 (provide 'magit-difftastic-test)
 ;;; magit-difftastic-test.el ends here
