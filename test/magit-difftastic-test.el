@@ -120,7 +120,7 @@ element is one displayed chunk's body (the header line dropped)."
          (header-re (difftastic--chunk-regexp t))
          (bodies nil) (chunk nil) (started nil))
     (dolist (line (split-string rendered "\n"))
-      (if (string-match-p header-re line)
+      (if (magit-difftastic--chunk-header-line-p header-re line)
           (progn (when started (push (string-join (nreverse chunk) "\n") bodies))
                  (setq chunk nil started t))
         (when started (push line chunk))))

@@ -1627,6 +1627,27 @@ section displays even when difft's text display merges several JSON chunks."
           (unless magit-difftastic-line-numbers
             (magit-difftastic--hide-line-numbers heading-start (point))))))))
 
+(defconst magit-difftastic--chunk-header-trailer-re
+  (rx " --- "
+      (or (+ (not (any " \n")))      ; a language token, e.g. "Clojure"
+          (seq "Text ("              ; the "Text (...)" error/limit form
+               (+ (not (any ")\n")))
+               ")"))
+      eol)
+  "Regexp matching the ` --- LANG' or ` --- Text (...)' trailer of a chunk header.
+Fallback for `difftastic--chunk-regexp' when the path begins with whitespace.")
+
+(defun magit-difftastic--chunk-header-line-p (header-re line)
+  "Return non-nil when LINE is a difftastic chunk header.
+Tries HEADER-RE first; falls back to the trailer regexp for lines starting with
+whitespace, which `difftastic--chunk-regexp' incorrectly rejects."
+  (or (string-match-p header-re line)
+      ;; `difftastic--chunk-regexp' anchors the filename group with
+      ;; `(not " ")', so it never matches a path that begins with a space.
+      ;; Detect those with the trailer regexp instead.
+      (and (string-match-p (rx bos " ") line)
+           (string-match-p magit-difftastic--chunk-header-trailer-re line))))
+
 (defun magit-difftastic--insert-chunks (rendered file context)
   "Split RENDERED difftastic output for FILE into collapsible per-chunk sections.
 Difftastic's own `FILE --- N/M --- LANG' headers are consumed (not shown); each
@@ -1638,7 +1659,7 @@ diff context plist threaded down to each chunk section."
         (started nil)
         (sections nil))
     (dolist (line lines)
-      (if (string-match-p header-re line)
+      (if (magit-difftastic--chunk-header-line-p header-re line)
           (progn
             (when started
               (push (magit-difftastic--insert-chunk (nreverse chunk) file context)
