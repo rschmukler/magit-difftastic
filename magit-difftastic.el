@@ -58,6 +58,14 @@
 ;; cannot render -- `--no-index' diffs, merge commits shown as combined diffs --
 ;; falls straight back to Magit's stock rendering.
 ;;
+;; In the side-by-side layouts difft sizes each file's columns to that file's
+;; own longest line, so the center divider (and the right-hand line numbers)
+;; would otherwise land at a different column per file.  By default
+;; (`magit-difftastic-align-columns') every two-column chunk in a buffer is
+;; padded so its right column lines up with the widest chunk's, keeping the
+;; divider and right-side line numbers aligned across the whole buffer; the
+;; padding only widens the gap between the columns, so staging is unaffected.
+;;
 ;; Rendering can also be toggled per file: with point on a file (or chunk),
 ;; `magit-difftastic-toggle-file-rendering' (bound to
 ;; `magit-difftastic-toggle-rendering-key', \\`C-c C-d' by default) switches
@@ -159,6 +167,26 @@ All three layouts support per-chunk and line-range (region) staging:
   "Whether difft's per-line number gutters are shown in rendered chunks.
 When nil, the line-number columns are hidden in the status, diff and revision
 buffers.  Staging works the same either way."
+  :type 'boolean
+  :group 'magit-difftastic)
+
+(defcustom magit-difftastic-align-columns t
+  "Whether to align the side-by-side columns across all chunks in a buffer.
+difft sizes each file's columns to that file's own longest line, so in a
+side-by-side layout the center divider -- and with it the right side's
+line-number gutter -- lands at a different column for each file, leaving the
+chunks visually ragged (this is what `magit-difftastic-display' renders).
+
+When non-nil (the default), every two-column chunk in a status, diff or
+revision buffer is padded so its right column begins at the same column as the
+widest chunk's, lining the divider and the right-hand line numbers up across
+the whole buffer.  The padding is inserted only in the gap between the two
+columns, so the rendered code -- and per-chunk/region staging -- are
+unaffected.
+
+Has no effect with the `inline' display (which has no right column) or on
+chunks difft collapses to a single column.  Set to nil to keep difftastic's
+compact, content-sized columns."
   :type 'boolean
   :group 'magit-difftastic)
 
@@ -1573,6 +1601,123 @@ Difftastic inline rows are prefixed with a right-aligned line number."
                (match-string 1 l)))
            body-lines))
 
+;;; Cross-chunk column alignment
+;;
+;; difft sizes each file's side-by-side columns to that file's own longest line,
+;; so the right column -- and its line-number gutter -- starts at a different
+;; column per file, leaving a buffer's chunks ragged.  When
+;; `magit-difftastic-align-columns' is on we pad every two-column chunk so its
+;; right column begins at the same display column as the widest chunk's.
+;;
+;; The padding is plain spaces inserted only in the gap BETWEEN the two columns
+;; (just before the right gutter), so: difft's colours and our syntax faces ride
+;; on the original text untouched; the gutters difftastic's parser reads stay at
+;; a per-chunk-consistent (only wider) column, so chunk/region staging and
+;; line-number hiding keep working; and the left column is never touched.
+
+(defvar magit-difftastic--align-col nil
+  "Dynamically-bound target display column for the right side-by-side column.
+Bound in `magit-difftastic--insert-file-sections' to the widest chunk's
+right-column start across the whole group (see
+`magit-difftastic--compute-align-col') when `magit-difftastic-align-columns' is
+enabled and a side-by-side layout is in use; each chunk's right column is then
+padded out to this column by `magit-difftastic--align-chunk-lines'.  nil
+disables alignment, so each chunk keeps difftastic's content-sized columns.")
+
+(defun magit-difftastic--two-column-display-p ()
+  "Return non-nil when `magit-difftastic-display' is a side-by-side layout."
+  (member magit-difftastic-display '("side-by-side" "side-by-side-show-both")))
+
+(defun magit-difftastic--split-chunk-bodies (rendered)
+  "Split RENDERED difftastic output into a list of per-chunk body line-lists.
+Difftastic's own `FILE --- N/M --- LANG' headers are dropped; each run of lines
+between them becomes one element (a list of strings), exactly as
+`magit-difftastic--insert-chunks' splits them for insertion."
+  (let ((header-re (difftastic--chunk-regexp t))
+        (chunk nil) (started nil) (bodies nil))
+    (dolist (line (split-string rendered "\n"))
+      (if (magit-difftastic--chunk-header-line-p header-re line)
+          (progn (when started (push (nreverse chunk) bodies))
+                 (setq chunk nil started t))
+        (when started (push line chunk))))
+    (when started (push (nreverse chunk) bodies))
+    (nreverse bodies)))
+
+(defun magit-difftastic--chunk-right-col (body-lines)
+  "Return the right column's start display-column for chunk BODY-LINES, or nil.
+nil when the chunk is single-column (purely additions/removals, or the inline
+layout) or difftastic's parser is unavailable.  The value is measured in
+display columns from the line start and is constant across the chunk's rows;
+the maximum over rows is returned defensively."
+  (when body-lines
+    (with-temp-buffer
+      ;; difftastic's parsers treat the first line of the bounds as the chunk
+      ;; header, so prepend a stand-in heading just as a real chunk has one.
+      (insert "@@ @@\n")
+      (dolist (l body-lines) (insert l "\n"))
+      (let ((beg (point-min)) (end (point-max)))
+        (when (eq (magit-difftastic--chunk-layout beg end) 'side-by-side)
+          (let ((cols (delq nil
+                            (mapcar
+                             (lambda (row)
+                               (pcase-let ((`((,bol ,_eol) ,_left ,right) row))
+                                 (when (and right (cadr right))
+                                   (string-width
+                                    (buffer-substring-no-properties
+                                     bol (cadr right))))))
+                             (magit-difftastic--parse-chunk-bounds beg end)))))
+            (and cols (apply #'max cols))))))))
+
+(defun magit-difftastic--compute-align-col (files)
+  "Return the widest right-column start display-column across FILES, or nil.
+Reads each file's rendered output from the dynamically-bound
+`magit-difftastic--render-cache' and takes the maximum over every two-column
+chunk (see `magit-difftastic--chunk-right-col').  nil when nothing is
+two-column, so alignment is skipped."
+  (let ((maxc nil))
+    (dolist (file files)
+      (when-let* ((rendered (and magit-difftastic--render-cache
+                                 (gethash file magit-difftastic--render-cache))))
+        (dolist (body (magit-difftastic--split-chunk-bodies rendered))
+          (when-let* ((c (magit-difftastic--chunk-right-col body)))
+            (setq maxc (if maxc (max maxc c) c))))))
+    maxc))
+
+(defun magit-difftastic--align-chunk-lines (body-lines target)
+  "Return BODY-LINES padded so the right column starts at display column TARGET.
+Two-column rows get plain spaces inserted just before their right gutter so its
+display column becomes TARGET; the left column and all text properties are
+preserved.  Single-column chunks (no right column) are returned unchanged."
+  (if (not body-lines)
+      body-lines
+    (with-temp-buffer
+      (insert "@@ @@\n")
+      (let ((body-start (point)))
+        (dolist (l body-lines) (insert l "\n"))
+        (let ((beg (point-min)) (end (point-max)))
+          (if (not (eq (magit-difftastic--chunk-layout beg end) 'side-by-side))
+              body-lines
+            ;; Pad rows back-to-front so an earlier row's parsed positions stay
+            ;; valid after a later row is widened.
+            (dolist (row (reverse (magit-difftastic--parse-chunk-bounds beg end)))
+              (pcase-let ((`((,bol ,_eol) ,_left ,right) row))
+                (when (and right (cadr right))
+                  (let* ((rbeg (cadr right))
+                         (cur (string-width
+                               (buffer-substring-no-properties bol rbeg)))
+                         (pad (- target cur)))
+                    (when (> pad 0)
+                      (save-excursion
+                        (goto-char rbeg)
+                        (insert (make-string pad ?\s))))))))
+            ;; Extract the (now padded) body lines back out, properties intact.
+            (let (out)
+              (goto-char body-start)
+              (dotimes (_ (length body-lines))
+                (push (buffer-substring (point) (line-end-position)) out)
+                (forward-line))
+              (nreverse out))))))))
+
 (defun magit-difftastic--insert-chunk (body-lines file context)
   "Insert one collapsible chunk section from BODY-LINES (difft header removed).
 FILE is the repo-relative path.  CONTEXT is the diff context plist (see
@@ -1589,6 +1734,12 @@ section displays even when difft's text display merges several JSON chunks."
     (while (and rev (string-blank-p (car rev)))
       (setq rev (cdr rev)))
     (setq body-lines (reverse rev)))
+  ;; Pad the inter-column gap so this chunk's right column lines up with the
+  ;; widest chunk's (a no-op for single-column chunks and when alignment is off).
+  (when (and body-lines magit-difftastic--align-col)
+    (setq body-lines
+          (magit-difftastic--align-chunk-lines
+           body-lines magit-difftastic--align-col)))
   (when body-lines
     (let* ((start (magit-difftastic--chunk-start-line body-lines))
            (heading (if start (format "@@ line %s @@" start) "@@ @@")))
@@ -1653,23 +1804,9 @@ whitespace, which `difftastic--chunk-regexp' incorrectly rejects."
 Difftastic's own `FILE --- N/M --- LANG' headers are consumed (not shown); each
 run of text between them becomes one displayed chunk section.  CONTEXT is the
 diff context plist threaded down to each chunk section."
-  (let ((header-re (difftastic--chunk-regexp t))
-        (lines (split-string rendered "\n"))
-        (chunk nil)
-        (started nil)
-        (sections nil))
-    (dolist (line lines)
-      (if (magit-difftastic--chunk-header-line-p header-re line)
-          (progn
-            (when started
-              (push (magit-difftastic--insert-chunk (nreverse chunk) file context)
-                    sections))
-            (setq chunk nil started t))
-        (when started
-          (push line chunk))))
-    (when started
-      (push (magit-difftastic--insert-chunk (nreverse chunk) file context)
-            sections))
+  (let ((sections nil))
+    (dolist (body (magit-difftastic--split-chunk-bodies rendered))
+      (push (magit-difftastic--insert-chunk body file context) sections))
     ;; Highlight the whole file in one pass: fetch and fontify each blob a single
     ;; time, bounded to the deepest line any chunk displays, then paint every
     ;; chunk from those shared vectors (see `magit-difftastic--apply-syntax-sections').
@@ -1877,7 +2014,14 @@ like it expands straight to its diff in Magit."
                                   (member f rename-origins)))
                   files)))
             (when render-files
-              (magit-difftastic--prewarm render-files context width ids)))))
+              (magit-difftastic--prewarm render-files context width ids))))
+         ;; With a side-by-side layout, align every chunk's right column to the
+         ;; widest chunk's across the whole group (see the "Cross-chunk column
+         ;; alignment" commentary); each chunk reads this target while inserting.
+         (magit-difftastic--align-col
+          (and magit-difftastic-align-columns
+               (magit-difftastic--two-column-display-p)
+               (magit-difftastic--compute-align-col files))))
     (dolist (file files)
       (unless (member file rename-origins)
         (if (member file magit-difftastic--stock-files)

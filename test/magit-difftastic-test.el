@@ -492,6 +492,123 @@ display-only, comparing the revision's blob against the worktree."
         (should (equal (plist-get context :old-source) '(blob "HEAD")))
         (should (equal (plist-get context :new-source) '(worktree)))))))
 
+;;;; Integration: cross-chunk column alignment (issue #2) -------------------
+
+(ert-deftest magit-difftastic-integration/align-columns-aligns-right-col ()
+  "Files of different widths get the same right column after alignment.
+Guards GH #2: difft sizes each file's columns to its own longest line, so the
+divider (and the right-side line numbers) lands at a different column per file;
+`--align-chunk-lines' pads the narrower chunk so both right columns start at
+the same display column."
+  (skip-unless dst-test--have-tools)
+  (skip-unless (fboundp 'difftastic--classify-chunk))
+  (dst-test--with-repo
+      '(("short.txt" . "alpha\nbravo\ncharlie\n")
+        ("long.txt"  . "x\nthis is a considerably longer line of text content here\ny\n"))
+      '(("short.txt" . "alpha\nBRAVO\ncharlie\n")
+        ("long.txt"  . "x\nthis is a considerably longer line of TEXT content here\ny\n"))
+    (let* ((magit-difftastic-display "side-by-side-show-both")
+           (magit-difftastic-width 160) ; deterministic, no wrapping in batch
+           (sbody (car (magit-difftastic--split-chunk-bodies
+                        (magit-difftastic--file-diff-string
+                         "short.txt" magit-difftastic--diff-base))))
+           (lbody (car (magit-difftastic--split-chunk-bodies
+                        (magit-difftastic--file-diff-string
+                         "long.txt" magit-difftastic--diff-base))))
+           (scol (magit-difftastic--chunk-right-col sbody))
+           (lcol (magit-difftastic--chunk-right-col lbody)))
+      ;; The two files' right columns start at different columns ...
+      (should scol)
+      (should lcol)
+      (should (/= scol lcol))
+      ;; ... but after aligning both to the wider target, they match exactly.
+      (let* ((target (max scol lcol))
+             (spad (magit-difftastic--align-chunk-lines sbody target))
+             (lpad (magit-difftastic--align-chunk-lines lbody target)))
+        (should (= target (magit-difftastic--chunk-right-col spad)))
+        (should (= target (magit-difftastic--chunk-right-col lpad)))))))
+
+(ert-deftest magit-difftastic-integration/compute-align-col-takes-max ()
+  "`--compute-align-col' returns the widest chunk's right column across files."
+  (skip-unless dst-test--have-tools)
+  (skip-unless (fboundp 'difftastic--classify-chunk))
+  (dst-test--with-repo
+      '(("short.txt" . "alpha\nbravo\ncharlie\n")
+        ("long.txt"  . "x\nthis is a considerably longer line of text content here\ny\n"))
+      '(("short.txt" . "alpha\nBRAVO\ncharlie\n")
+        ("long.txt"  . "x\nthis is a considerably longer line of TEXT content here\ny\n"))
+    (let* ((magit-difftastic-display "side-by-side-show-both")
+           (magit-difftastic-width 160)
+           (files '("short.txt" "long.txt"))
+           (magit-difftastic--render-cache
+            (let ((h (make-hash-table :test 'equal)))
+              (dolist (f files)
+                (puthash f (magit-difftastic--file-diff-string
+                            f magit-difftastic--diff-base)
+                         h))
+              h))
+           (scol (magit-difftastic--chunk-right-col
+                  (car (magit-difftastic--split-chunk-bodies
+                        (gethash "short.txt" magit-difftastic--render-cache)))))
+           (lcol (magit-difftastic--chunk-right-col
+                  (car (magit-difftastic--split-chunk-bodies
+                        (gethash "long.txt" magit-difftastic--render-cache))))))
+      (should (= (magit-difftastic--compute-align-col files)
+                 (max scol lcol))))))
+
+(ert-deftest magit-difftastic-integration/align-columns-preserves-staging ()
+  "Aligning a chunk's columns does not break whole-chunk staging.
+The padding only widens the gap before the right gutter, so difftastic's parser
+still reads the same line numbers and `git apply' stages the right git hunks."
+  (skip-unless dst-test--have-tools)
+  (skip-unless (fboundp 'difftastic--classify-chunk))
+  (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
+      `(("sample.txt" . ,dst-test--new))
+    (let* ((magit-difftastic-display "side-by-side-show-both")
+           (magit-difftastic-width 160)
+           (body (car (magit-difftastic--split-chunk-bodies
+                       (magit-difftastic--file-diff-string
+                        "sample.txt" magit-difftastic--diff-base))))
+           (col (magit-difftastic--chunk-right-col body))
+           ;; Pad the right column well past its natural position.
+           (padded (magit-difftastic--align-chunk-lines body (+ col 30))))
+      (should (= (+ col 30) (magit-difftastic--chunk-right-col padded)))
+      (with-temp-buffer
+        (insert "@@ line 1 @@\n")
+        (dolist (l padded) (insert l "\n"))
+        (let* ((value (list :file "sample.txt" :staged nil))
+               (sec (dst-test--make-section
+                     (point-min)
+                     (save-excursion (goto-char (point-min)) (line-end-position))
+                     (point-max) value))
+               (patch (magit-difftastic--chunk-patch sec)))
+          (should patch)
+          (with-temp-buffer
+            (insert patch)
+            (should (eq 0 (call-process-region
+                           (point-min) (point-max) "git" nil nil nil
+                           "apply" "--cached" "-"))))
+          (let ((staged (dst-test--git "--no-pager" "diff" "--cached")))
+            (should (string-match-p "^\\+BRAVO-changed$" staged))
+            (should (string-match-p "^\\+delta-modified$" staged))
+            (should (string-match-p "^\\+golf-added$" staged))))))))
+
+(ert-deftest magit-difftastic-integration/align-columns-inline-noop ()
+  "Alignment is a no-op for the inline (single-column) layout.
+`--two-column-display-p' is nil for inline, `--chunk-right-col' yields nil, and
+`--align-chunk-lines' returns a single-column chunk's lines unchanged."
+  (skip-unless dst-test--have-tools)
+  (let ((magit-difftastic-display "inline")
+        (magit-difftastic-width 160))
+    (should-not (magit-difftastic--two-column-display-p))
+    (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
+        `(("sample.txt" . ,dst-test--new))
+      (let ((body (car (magit-difftastic--split-chunk-bodies
+                        (magit-difftastic--file-diff-string
+                         "sample.txt" magit-difftastic--diff-base)))))
+        (should-not (magit-difftastic--chunk-right-col body))
+        (should (equal (magit-difftastic--align-chunk-lines body 80) body))))))
+
 ;;;; Integration: parallel rendering ---------------------------------------
 
 (ert-deftest magit-difftastic-integration/render-files-matches-sync ()
