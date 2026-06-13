@@ -212,6 +212,36 @@ element is one displayed chunk's body (the header line dropped)."
   (should (equal (magit-difftastic--chunk-start-line '("7 x")) "7"))
   (should-not (magit-difftastic--chunk-start-line '("no numbers" "here"))))
 
+;;;; Unit tests: evil key gating (issue #4) --------------------------------
+
+(ert-deftest magit-difftastic--set-evil-keys/honors-option ()
+  "Evil staging keys are bound only when the mode is on AND the option is set.
+Guards GH #4: `magit-difftastic-bind-evil-keys' must let users opt out of the
+`s'/`u'/`x' bindings; when off (or when disabling), the keys are unbound (nil
+definitions) so they fall through to the user's own bindings."
+  (let (calls)
+    (cl-letf (((symbol-function 'evil-define-key*)
+               (lambda (_states _map key def) (push (cons key def) calls))))
+      ;; mode on + option on -> our staging commands are bound.
+      (setq calls nil)
+      (let ((magit-difftastic-bind-evil-keys t))
+        (magit-difftastic--set-evil-keys t))
+      (should calls)
+      (should (assoc "s" calls))
+      (should (cl-every #'cdr calls))   ; every definition non-nil
+      ;; mode on + option off -> keys unbound (every definition nil).
+      (setq calls nil)
+      (let ((magit-difftastic-bind-evil-keys nil))
+        (magit-difftastic--set-evil-keys t))
+      (should calls)
+      (should-not (cl-some #'cdr calls))
+      ;; mode off -> unbound regardless of the option.
+      (setq calls nil)
+      (let ((magit-difftastic-bind-evil-keys t))
+        (magit-difftastic--set-evil-keys nil))
+      (should calls)
+      (should-not (cl-some #'cdr calls)))))
+
 ;;;; Unit tests: width / wrapping knob -------------------------------------
 
 (ert-deftest magit-difftastic--width/honors-custom ()
