@@ -135,6 +135,12 @@
 ;;     rendering replaces Magit's diff section wholesale, so the usual diffstat
 ;;     header is not shown there.  Merge commits (combined diffs) and
 ;;     `--no-index' diffs fall back to Magit's stock rendering.
+;;   - Whitespace-ignoring diff flags (`-w', `--ignore-blank-lines', ...) are
+;;     honoured at FILE granularity: difft has no whitespace-ignore option (and
+;;     Git does not pass these to an external diff tool), so a file whose only
+;;     differences are whitespace is dropped from the view, but whitespace noise
+;;     mixed with real changes inside a (plain-text) file is still shown.  For
+;;     recognised languages difft already ignores whitespace structurally.
 ;;
 ;; Toggle with `magit-difftastic-mode' (global).  When off, Magit's
 ;; stock unstaged/staged sections are used, so you can always fall back.
@@ -2046,7 +2052,8 @@ like it expands straight to its diff in Magit."
 
 (defun magit-difftastic-insert-unstaged-changes ()
   "Difftastic replacement for `magit-insert-unstaged-changes'."
-  (when-let* ((files (magit-unstaged-files)))
+  (when-let* ((files (magit-difftastic--drop-whitespace-only
+                      (magit-unstaged-files) nil)))    ; worktree vs index
     (magit-insert-section (unstaged)
       (magit-insert-heading t "Unstaged changes")
       (magit-difftastic--insert-file-sections
@@ -2058,7 +2065,8 @@ like it expands straight to its diff in Magit."
 (defun magit-difftastic-insert-staged-changes ()
   "Difftastic replacement for `magit-insert-staged-changes'."
   (unless (magit-bare-repo-p)
-    (when-let* ((files (magit-staged-files)))
+    (when-let* ((files (magit-difftastic--drop-whitespace-only
+                        (magit-staged-files) '("--cached"))))
       (magit-insert-section (staged)
         (magit-insert-heading t "Staged changes")
         (magit-difftastic--insert-file-sections
@@ -2121,6 +2129,7 @@ When nil, viewing a commit keeps Magit's stock rendering even while
 (defvar magit-buffer-range)
 (defvar magit-buffer-typearg)
 (defvar magit-buffer-diff-files)
+(defvar magit-buffer-diff-args)
 (defvar magit-buffer-revision)
 
 (defun magit-difftastic--git-lines (&rest args)
@@ -2128,6 +2137,64 @@ When nil, viewing a commit keeps Magit's stock rendering even while
   (with-temp-buffer
     (apply #'process-file "git" nil t nil args)
     (split-string (buffer-string) "\n" t)))
+
+;;; Whitespace-ignoring diff flags
+;;
+;; difft has no whitespace-ignore option, and Git does not apply its own
+;; whitespace flags (`-w', `--ignore-blank-lines', ...) to an external diff tool,
+;; so we cannot make difft skip whitespace within a file.  But difft already
+;; ignores whitespace structurally for recognised languages, and for the
+;; remaining noise -- files whose ONLY differences are whitespace -- we honour
+;; the user's intent at file granularity: when such a flag is active in the
+;; magit buffer's diff args, we forward it to the plumbing that lists changed
+;; files, so a whitespace-only file simply drops out (exactly as stock Magit
+;; shows nothing for it) while files with real changes are still rendered.
+
+(defconst magit-difftastic--whitespace-flags
+  '("-w" "--ignore-all-space"
+    "-b" "--ignore-space-change"
+    "--ignore-space-at-eol"
+    "--ignore-blank-lines"
+    "--ignore-cr-at-eol")
+  "Git `diff' flags that ignore some class of whitespace difference.")
+
+(defun magit-difftastic--whitespace-args ()
+  "Return the whitespace-ignoring flags active in the current buffer's diff args.
+Reads `magit-buffer-diff-args' (Magit's per-buffer `diff' arguments) and keeps
+only the entries in `magit-difftastic--whitespace-flags'.  These are forwarded
+to the file-listing queries (see `magit-difftastic--drop-whitespace-only' and
+`magit-difftastic--diff-context') so whitespace-only files are dropped -- difft
+itself cannot honour them."
+  (when (boundp 'magit-buffer-diff-args)
+    (seq-filter (lambda (a) (member a magit-difftastic--whitespace-flags))
+                magit-buffer-diff-args)))
+
+(defun magit-difftastic--drop-whitespace-only (files selector)
+  "Return FILES without entries whose only changes are whitespace.
+Honours the whitespace-ignoring flags active in the current buffer (see
+`magit-difftastic--whitespace-args'); a no-op when none are set or FILES is
+empty.  SELECTOR is the git `diff' selector for the view -- nil for the
+worktree against the index, `(\"--cached\")' for the index against HEAD, or a
+range list.
+
+Uses `git diff --numstat WS SELECTOR': unlike `--name-only', `--numstat'
+applies the whitespace flags to the change decision, so a file whose only
+differences are whitespace is absent from its output.  We keep only the files
+it still reports as changed -- matching what stock Magit shows."
+  (let ((ws (magit-difftastic--whitespace-args)))
+    (if (or (null ws) (null files))
+        files
+      (let* ((lines (apply #'magit-difftastic--git-lines
+                           (append '("--no-pager" "diff" "--numstat")
+                                   ws selector '("--") files)))
+             ;; Each line is "ADDED\tDELETED\tPATH" (binary: "-\t-\tPATH").
+             (changed (delq nil
+                            (mapcar (lambda (l)
+                                      (when (string-match
+                                             "\\`[^\t]*\t[^\t]*\t\\(.*\\)\\'" l)
+                                        (match-string 1 l)))
+                                    lines))))
+        (seq-filter (lambda (f) (member f changed)) files)))))
 
 (defun magit-difftastic--diff-context ()
   "Return a (CONTEXT . FILES) pair for the current `magit-diff-mode' buffer.
@@ -2167,9 +2234,14 @@ that names a range/revision is rendered display-only."
                       :stock-args stock-args
                       :old-source (car range-src) :new-source (cdr range-src)
                       :staged nil :stageable nil))))
-             (files (apply #'magit-difftastic--git-lines
-                           (append '("--no-pager" "diff" "--name-only")
-                                   selector '("--") diff-files))))
+             ;; difft cannot ignore whitespace, so when the user set a
+             ;; whitespace-ignore flag on the diff, drop files whose only
+             ;; differences are whitespace (GH #5).
+             (files (magit-difftastic--drop-whitespace-only
+                     (apply #'magit-difftastic--git-lines
+                            (append '("--no-pager" "diff" "--name-only")
+                                    selector '("--") diff-files))
+                     selector)))
         (and files (cons context files))))))
 
 (defun magit-difftastic--revision-context ()

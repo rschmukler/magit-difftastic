@@ -639,6 +639,61 @@ still reads the same line numbers and `git apply' stages the right git hunks."
         (should-not (magit-difftastic--chunk-right-col body))
         (should (equal (magit-difftastic--align-chunk-lines body 80) body))))))
 
+;;;; Whitespace-ignoring diff flags (issue #5) -----------------------------
+
+(ert-deftest magit-difftastic--whitespace-args/extracts-flags ()
+  "Only the whitespace-ignoring flags are picked out of the buffer's diff args."
+  (let ((magit-buffer-diff-args
+         '("--stat" "-w" "--ignore-blank-lines" "--no-ext-diff")))
+    (should (equal (magit-difftastic--whitespace-args)
+                   '("-w" "--ignore-blank-lines"))))
+  (let ((magit-buffer-diff-args '("--stat" "--no-ext-diff")))
+    (should-not (magit-difftastic--whitespace-args))))
+
+(ert-deftest magit-difftastic-integration/drop-whitespace-only ()
+  "Whitespace-only files drop out only when a whitespace flag is active.
+Guards GH #5: difft cannot ignore whitespace, so we let git decide which files
+still differ under the active flags and render only those."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo
+      '(("real.txt" . "alpha\nbravo\n")
+        ("ws.txt"   . "one\ntwo\n"))
+      '(("real.txt" . "alpha\nBRAVO\n")    ; a real change
+        ("ws.txt"   . "one  \n  two\n"))   ; whitespace-only change
+    (let ((files '("real.txt" "ws.txt")))
+      ;; No whitespace flag -> both kept.
+      (let ((magit-buffer-diff-args '("--stat")))
+        (should (equal (magit-difftastic--drop-whitespace-only files nil)
+                       '("real.txt" "ws.txt"))))
+      ;; -w active -> the whitespace-only file is dropped, the real one kept.
+      (let ((magit-buffer-diff-args '("--ignore-all-space")))
+        (should (equal (magit-difftastic--drop-whitespace-only files nil)
+                       '("real.txt")))))))
+
+(ert-deftest magit-difftastic-integration/diff-context-ignores-whitespace ()
+  "`--diff-context' excludes whitespace-only files when a flag is active.
+The worktree (unstaged) diff lists files via `git diff --name-only', to which
+the whitespace flags are now forwarded."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo
+      '(("real.txt" . "alpha\nbravo\n")
+        ("ws.txt"   . "one\ntwo\n"))
+      '(("real.txt" . "alpha\nBRAVO\n")
+        ("ws.txt"   . "one  \n  two\n"))
+    (let ((magit-buffer-range nil)
+          (magit-buffer-typearg nil)
+          (magit-buffer-diff-files nil))
+      ;; No whitespace flag: both files render.
+      (let* ((magit-buffer-diff-args '("--stat"))
+             (files (cdr (magit-difftastic--diff-context))))
+        (should (member "real.txt" files))
+        (should (member "ws.txt" files)))
+      ;; -w active: only the file with a real change is rendered.
+      (let* ((magit-buffer-diff-args '("-w"))
+             (files (cdr (magit-difftastic--diff-context))))
+        (should (member "real.txt" files))
+        (should-not (member "ws.txt" files))))))
+
 ;;;; Integration: parallel rendering ---------------------------------------
 
 (ert-deftest magit-difftastic-integration/render-files-matches-sync ()
