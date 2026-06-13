@@ -445,6 +445,53 @@ renderer relies on the ORIG to drop that stray OLD entry; see
                        "\n" t)))
       (should (member "original.txt" rename-origins)))))
 
+;;;; Integration: diff-mode range rendering (issue #1) ---------------------
+
+(ert-deftest magit-difftastic-integration/diff-context-range ()
+  "A `magit-diff-range' buffer is rendered with difftastic, display-only.
+Guards GH #1: `magit-diff-range' sets `magit-buffer-range' (with no typearg),
+which must yield a non-nil render context -- so difftastic IS used -- but one
+that is NOT stageable, since a two-revision range has no index/worktree side to
+stage against."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("sample.txt" . "alpha\nbravo\ncharlie\n")) nil
+    ;; A second commit, so HEAD~1..HEAD is a real two-revision range.
+    (dst-test--write "sample.txt" "alpha\nBRAVO\ncharlie\ndelta\n")
+    (dst-test--git "commit" "-aqm" "two")
+    (let ((magit-buffer-range "HEAD~1..HEAD")
+          (magit-buffer-typearg nil)
+          (magit-buffer-diff-files nil))
+      (let* ((result (magit-difftastic--diff-context))
+             (context (car result))
+             (files (cdr result)))
+        ;; Difftastic IS used: a render context is returned for the range ...
+        (should result)
+        (should (member "sample.txt" files))
+        (should (member "HEAD~1..HEAD" (plist-get context :diff-args)))
+        ;; ... but display-only (a revision range has no stageable side).
+        (should-not (plist-get context :stageable))
+        (should-not (plist-get context :staged))
+        (should (equal (plist-get context :old-source) '(blob "HEAD~1")))
+        (should (equal (plist-get context :new-source) '(blob "HEAD")))))))
+
+(ert-deftest magit-difftastic-integration/diff-context-single-rev ()
+  "A bare-revision `magit-diff-range' diffs that revision against the worktree.
+Guards GH #1 for the single-revision form (no `..'): difftastic is still used,
+display-only, comparing the revision's blob against the worktree."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("sample.txt" . "alpha\nbravo\ncharlie\n"))
+      '(("sample.txt" . "alpha\nBRAVO\ncharlie\ndelta\n"))
+    (let ((magit-buffer-range "HEAD")
+          (magit-buffer-typearg nil)
+          (magit-buffer-diff-files nil))
+      (let* ((result (magit-difftastic--diff-context))
+             (context (car result)))
+        (should result)
+        (should (member "sample.txt" (cdr result)))
+        (should-not (plist-get context :stageable))
+        (should (equal (plist-get context :old-source) '(blob "HEAD")))
+        (should (equal (plist-get context :new-source) '(worktree)))))))
+
 ;;;; Integration: parallel rendering ---------------------------------------
 
 (ert-deftest magit-difftastic-integration/render-files-matches-sync ()
