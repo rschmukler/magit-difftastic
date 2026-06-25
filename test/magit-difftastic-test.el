@@ -694,11 +694,11 @@ the whitespace flags are now forwarded."
         (should (member "real.txt" files))
         (should-not (member "ws.txt" files))))))
 
-;;;; Integration: parallel rendering ---------------------------------------
+;;;; Integration: batch rendering ------------------------------------------
 
 (ert-deftest magit-difftastic-integration/render-files-matches-sync ()
-  "`--render-files' renders a batch in parallel, matching the sync path.
-Each file's parallel result must equal what `--render-raw' produces serially,
+  "`--render-files' renders a batch matching the raw render path.
+Each file's batch result must equal what `--render-raw' produces directly,
 and every requested file must be present in the returned hash."
   (skip-unless dst-test--have-tools)
   (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
@@ -710,15 +710,15 @@ and every requested file must be present in the returned hash."
     (let* ((files '("a.txt" "b.txt" "c.txt"))
            (width (magit-difftastic--width))
            (jobs (mapcar (lambda (f) (cons f magit-difftastic--diff-base)) files))
-           (parallel (magit-difftastic--render-files jobs width)))
-      (should (= (hash-table-count parallel) (length files)))
+           (rendered (magit-difftastic--render-files jobs width)))
+      (should (= (hash-table-count rendered) (length files)))
       (dolist (f files)
-        (should (equal (gethash f parallel)
+        (should (equal (gethash f rendered)
                        (magit-difftastic--render-raw
                         f magit-difftastic--diff-base width)))))))
 
-(ert-deftest magit-difftastic-integration/render-files-serial-limit ()
-  "`--render-files' still yields correct output when limited to one job at a time."
+(ert-deftest magit-difftastic-integration/render-files-ignores-render-jobs ()
+  "`--render-files' yields correct output regardless of obsolete job limit."
   (skip-unless dst-test--have-tools)
   (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
                          ("b.txt" . "one\ntwo\n"))
@@ -728,10 +728,10 @@ and every requested file must be present in the returned hash."
            (files '("a.txt" "b.txt"))
            (width (magit-difftastic--width))
            (jobs (mapcar (lambda (f) (cons f magit-difftastic--diff-base)) files))
-           (parallel (magit-difftastic--render-files jobs width)))
-      (should (= (hash-table-count parallel) (length files)))
+           (rendered (magit-difftastic--render-files jobs width)))
+      (should (= (hash-table-count rendered) (length files)))
       (dolist (f files)
-        (should (equal (gethash f parallel)
+        (should (equal (gethash f rendered)
                        (magit-difftastic--render-raw
                         f magit-difftastic--diff-base width)))))))
 
@@ -827,7 +827,7 @@ invocation, feeding both the caches (ids) and the file headings (status)."
                    (setq rendered-again jobs)
                    (make-hash-table :test 'equal))))
         (let ((second (magit-difftastic--prewarm files context width)))
-          ;; No misses -> the parallel renderer is never invoked.
+          ;; No misses -> the renderer is never invoked.
           (should-not rendered-again)
           (should (= (hash-table-count second) 2))
           (dolist (f files)

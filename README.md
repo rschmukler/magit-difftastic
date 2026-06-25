@@ -148,7 +148,7 @@ Evil is absent, this is skipped entirely — no hard dependency.
 | `magit-difftastic-syntax-highlight`     | `t`          | Layer the file's Emacs major-mode font-lock faces onto each chunk's code (difft only emphasizes keywords/comments). Diff colors keep precedence. Adds per-file fontification cost; set `nil` to disable. |
 | `magit-difftastic-width`                | `window`     | Column width passed to difft, controlling where it wraps long lines: `window` (fit the window) or an integer (fixed columns; larger wraps less). |
 | `magit-difftastic-min-width`            | `40`         | Minimum column width requested from difft. |
-| `magit-difftastic-render-jobs`          | `nil`        | Maximum number of `difft` processes run concurrently per refresh. `nil` uses the processor count (capped); a positive integer sets a fixed limit (`1` renders serially). |
+| `magit-difftastic-render-jobs`          | `nil`        | Obsolete; rendering is now synchronous during Magit refresh. |
 | `magit-difftastic-cache`                | `t`          | Cache rendered difft output across refreshes, keyed on the compared blobs (plus display and width), so unchanged files are not re-rendered. Clear with `magit-difftastic-clear-cache`. |
 | `magit-difftastic-chunk-heading-face`   | `magit-diff-hunk-heading` | Face for the per-chunk `@@ line N @@` headings. Defaults to Magit's hunk-heading face (a full-width bar); set to e.g. `magit-hash` for understated headings. |
 | `magit-difftastic-apply-context`        | `1`          | Context lines for the git hunks used to stage/unstage chunks. Must be `>= 1`. |
@@ -180,12 +180,11 @@ evil-state-agnostic.
 - Region staging operates within a single chunk; whole-chunk staging snaps to
   the underlying git-hunk boundary (the same one Magit's per-hunk staging uses).
 - `difft` runs once per changed file when its content first needs rendering.
-  Files in a section are rendered concurrently (up to `magit-difftastic-render-jobs`
-  at a time) and the output is cached across refreshes keyed on the compared
-  blobs (`magit-difftastic-cache`), so unchanged files are not re-rendered — a
-  refresh costs roughly the slowest file that actually changed. A very large set
-  of first-time changes can still feel sluggish, since the refresh waits for that
-  initial batch. Clear the cache with `M-x magit-difftastic-clear-cache`.
+  The output is cached across refreshes keyed on the compared blobs
+  (`magit-difftastic-cache`), so unchanged files are not re-rendered. A very
+  large set of first-time changes can still feel sluggish, since the refresh
+  waits for that initial batch. Clear the cache with
+  `M-x magit-difftastic-clear-cache`.
 - Untracked files use the stock `magit-insert-untracked-files`.
 - In `magit-diff-mode` / `magit-revision-mode`, difftastic replaces Magit's diff
   section wholesale, so the diffstat header isn't shown. Merge commits and

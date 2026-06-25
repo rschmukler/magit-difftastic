@@ -122,13 +122,10 @@
 ;;     that contains it.  Whole-chunk staging snaps to the underlying git hunk
 ;;     boundary -- the same boundary Magit's own per-hunk staging uses.
 ;;   - `difft' is run once per changed file when its content first needs
-;;     rendering.  Files in a section are rendered concurrently (up to
-;;     `magit-difftastic-render-jobs' processes at a time) and the result is
-;;     cached across refreshes keyed on the compared blobs (see
-;;     `magit-difftastic-cache'), so an unchanged file is not re-rendered -- a
-;;     refresh costs roughly the slowest file that actually changed.  A very
-;;     large set of first-time changes can still make `magit-status' sluggish,
-;;     since the refresh waits for that initial batch.
+;;     rendering.  Rendered output is cached across refreshes keyed on the
+;;     compared blobs (see `magit-difftastic-cache'), so an unchanged file is
+;;     not re-rendered.  A very large set of first-time changes can still make
+;;     `magit-status' sluggish, since the refresh waits for that initial batch.
 ;;   - Untracked files are still rendered by the stock
 ;;     `magit-insert-untracked-files'.
 ;;   - In `magit-diff-mode'/`magit-revision-mode' buffers the difftastic
@@ -244,17 +241,12 @@ At least `magit-difftastic-min-width' columns are always used.  The
   :group 'magit-difftastic)
 
 (defcustom magit-difftastic-render-jobs nil
-  "Maximum number of `difft' processes to run concurrently while rendering.
-On every refresh each changed file is rendered by its own `difft' subprocess;
-running them concurrently makes the rendering wall-clock time roughly the
-slowest single file rather than the sum of all of them.
-
-  - nil (default): use the number of available processors (when Emacs can
-    report it), capped at a sensible maximum, else a small fixed number.
-  - a positive integer: run at most that many `difft' processes at once.  A
-    value of 1 renders serially (the pre-2.x behaviour)."
-  :type '(choice (const :tag "Auto (number of processors)" nil)
-                 (integer :tag "Fixed maximum"))
+  "Obsolete option formerly used for concurrent `difft' rendering.
+Rendering is now synchronous because Magit refresh already blocks until all
+files are rendered, and the previous async process pool could stall waiting for
+process sentinels in the middle of refresh."
+  :type '(choice (const :tag "Ignored" nil)
+                 (integer :tag "Ignored"))
   :group 'magit-difftastic)
 
 (defun magit-difftastic--width ()
@@ -276,7 +268,7 @@ The revision and the `-- FILE' pathspec are appended to this.")
 (defvar magit-difftastic--render-cache nil
   "Dynamically-bound hash of FILE -> pre-rendered difft string for one group.
 Bound in `magit-difftastic--insert-file-sections' to the result of rendering
-that group's files in parallel (see `magit-difftastic--render-files'), so the
+that group's files (see `magit-difftastic--render-files'), so the
 synchronous section-insertion pass reads each file's already-computed difft
 output instead of spawning a subprocess inline.  A cache miss falls back to a
 direct synchronous render, so the cache is purely an optimisation.")
@@ -284,7 +276,7 @@ direct synchronous render, so the cache is purely an optimisation.")
 (defun magit-difftastic--render-raw (file diff-args width)
   "Run `git DIFF-ARGS -- FILE' through difft at WIDTH and return propertized text.
 Synchronous; used as the fallback when no pre-warmed entry exists (see
-`magit-difftastic--render-cache') and as the worker the parallel runner mirrors."
+`magit-difftastic--render-cache') and by the batch renderer."
   (require 'difftastic)
   (let ((raw (with-temp-buffer
                ;; `difftastic--build-git-process-environment' sets
@@ -310,74 +302,22 @@ appended as a pathspec.  For example, `(\"--no-pager\" \"diff\" \"--ext-diff\"
 `(\"--no-pager\" \"show\" \"--ext-diff\" \"--format=\" REV)' renders a commit.
 
 When `magit-difftastic--render-cache' holds a pre-warmed entry for FILE (the
-common case during a refresh, where the whole group was rendered in parallel up
-front) it is returned directly; otherwise FILE is rendered synchronously now."
+common case during a refresh, where the whole group was rendered up front) it
+is returned directly; otherwise FILE is rendered synchronously now."
   (or (and magit-difftastic--render-cache
            (gethash file magit-difftastic--render-cache))
       (magit-difftastic--render-raw file diff-args (magit-difftastic--width))))
 
-(defun magit-difftastic--max-jobs ()
-  "Return the maximum number of concurrent difft processes to run.
-Honours `magit-difftastic-render-jobs'; when that is nil, uses the processor
-count (capped) when Emacs can report it, else a small fixed default."
-  (cond
-   ((integerp magit-difftastic-render-jobs)
-    (max 1 magit-difftastic-render-jobs))
-   ((fboundp 'num-processors) (max 1 (min 16 (num-processors))))
-   (t 4)))
-
 (defun magit-difftastic--render-files (jobs width)
-  "Render difft for JOBS in parallel; return a hash of FILE -> rendered string.
+  "Render difft for JOBS; return a hash of FILE -> rendered string.
 JOBS is a list of (FILE . DIFF-ARGS).  Each job runs `git DIFF-ARGS -- FILE'
-through difft (exactly as `magit-difftastic--render-raw' does synchronously) at
-WIDTH columns, but up to `magit-difftastic--max-jobs' of them run concurrently
-via `start-file-process' (the TRAMP-aware async counterpart of `process-file'),
-so a group's rendering cost is roughly its slowest file rather than the sum.
-
-Blocks until every job has finished, then returns the populated hash; a job
-whose process fails simply yields nil for that file, so the caller falls back to
-a synchronous render."
-  (require 'difftastic)
-  (let* ((results (make-hash-table :test 'equal))
-         (queue (copy-sequence jobs))
-         (max-jobs (magit-difftastic--max-jobs))
-         (running 0)
-         (pending (length jobs))
-         ;; difft is selected purely through the environment (GIT_EXTERNAL_DIFF
-         ;; etc.); the same env is reused for every process in the group.
-         (env (difftastic--build-git-process-environment
-               width (list "--display" magit-difftastic-display))))
-    (cl-labels
-        ((launch ()
-           (while (and queue (< running max-jobs))
-             (let* ((job (pop queue))
-                    (file (car job))
-                    (args (append (cdr job) (list "--" file)))
-                    (buf (generate-new-buffer " *magit-difftastic-render*"))
-                    (process-environment env)
-                    (proc (apply #'start-file-process
-                                 "magit-difftastic-render" buf "git" args)))
-               (cl-incf running)
-               (set-process-query-on-exit-flag proc nil)
-               (set-process-sentinel
-                proc
-                (lambda (p _event)
-                  (unless (process-live-p p)
-                    (let ((b (process-buffer p)))
-                      (when (buffer-live-p b)
-                        (with-current-buffer b
-                          (puthash file
-                                   (difftastic--ansi-color-apply (buffer-string))
-                                   results))
-                        (kill-buffer b)))
-                    (cl-decf running)
-                    (cl-decf pending)
-                    ;; A finished slot frees room for the next queued job.
-                    (launch))))))))
-      (launch)
-      ;; Pump the event loop until every sentinel has fired.
-      (while (> pending 0)
-        (accept-process-output nil 0.05)))
+through difft at WIDTH columns.  Rendering is done synchronously with
+`process-file', matching the rest of Magit's refresh path and avoiding the
+event-loop and sentinel dependency of an async process pool."
+  (let ((results (make-hash-table :test 'equal)))
+    (pcase-dolist (`(,file . ,diff-args) jobs)
+      (puthash file (magit-difftastic--render-raw file diff-args width)
+               results))
     results))
 
 ;;; Render cache
@@ -1910,7 +1850,7 @@ is the default rendering; see `magit-difftastic--insert-file-sections'."
   "Return a FILE -> rendered-string hash for RENDER-FILES of CONTEXT at WIDTH.
 Files whose content is unchanged since an earlier refresh are served from the
 persistent cache (`magit-difftastic--cache'); the remaining files are rendered
-concurrently (`magit-difftastic--render-files') and then stored in that cache.
+by `magit-difftastic--render-files' and then stored in that cache.
 Files that cannot be content-keyed (or when `magit-difftastic-cache' is nil) are
 simply rendered every time.
 
@@ -2012,7 +1952,7 @@ like it expands straight to its diff in Magit."
          ;; front (stock-rendered files and rename sources are skipped -- the
          ;; former go through `magit--insert-diff', the latter are not shown).
          ;; Unchanged files are served from the cross-refresh cache and the rest
-         ;; rendered in one parallel batch; the synchronous insertion loop below
+         ;; rendered in one batch; the synchronous insertion loop below
          ;; then reads each file's output from this hash via
          ;; `magit-difftastic--file-diff-string'.
          (magit-difftastic--render-cache
