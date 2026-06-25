@@ -375,9 +375,16 @@ a synchronous render."
                     ;; A finished slot frees room for the next queued job.
                     (launch))))))))
       (launch)
-      ;; Pump the event loop until every sentinel has fired.
-      (while (> pending 0)
-        (accept-process-output nil 0.05)))
+      ;; Pump the event loop until every sentinel has fired.  We run inside a
+      ;; `magit-refresh', and `accept-process-output' with a nil process drains
+      ;; the whole event loop, so a foreign sentinel/timer can fire here and call
+      ;; `magit-refresh' -- which re-enters this renderer and pumps again: an
+      ;; unbounded refresh->render loop that freezes Emacs (#6).  Binding
+      ;; `magit-inhibit-refresh' (refresh's only reentrancy guard) makes any such
+      ;; nested refresh a no-op; the outer refresh already reads fresh state.
+      (let ((magit-inhibit-refresh t))
+        (while (> pending 0)
+          (accept-process-output nil 0.05))))
     results))
 
 ;;; Render cache
