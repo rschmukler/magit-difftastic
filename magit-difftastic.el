@@ -273,6 +273,13 @@ appended to this.")
   "Leading git invocation for difftastic `git show' (commit) rendering.
 The revision and the `-- FILE' pathspec are appended to this.")
 
+(defun magit-difftastic--git-args (args)
+  "Return git ARGS with `--no-pager' present.
+Git only honors `--no-pager' before the subcommand.  All internal Git
+subprocesses in this package are noninteractive and capture output in Emacs, so
+they should never invoke the user's pager."
+  (cons "--no-pager" (remove "--no-pager" args)))
+
 (defvar magit-difftastic--render-cache nil
   "Dynamically-bound hash of FILE -> pre-rendered difft string for one group.
 Bound in `magit-difftastic--insert-file-sections' to the result of rendering
@@ -295,7 +302,8 @@ Synchronous; used as the fallback when no pre-warmed entry exists (see
                       (difftastic--build-git-process-environment
                        width (list "--display" magit-difftastic-display))))
                  (apply #'process-file "git" nil t nil
-                        (append diff-args (list "--" file))))
+                        (magit-difftastic--git-args
+                         (append diff-args (list "--" file)))))
                (buffer-string))))
     ;; Turn difft's ANSI escapes into propertized text using difftastic's
     ;; own colour vectors (so it matches `difftastic-magit-diff').
@@ -352,7 +360,8 @@ a synchronous render."
            (while (and queue (< running max-jobs))
              (let* ((job (pop queue))
                     (file (car job))
-                    (args (append (cdr job) (list "--" file)))
+                    (args (magit-difftastic--git-args
+                           (append (cdr job) (list "--" file))))
                     (buf (generate-new-buffer " *magit-difftastic-render*"))
                     (process-environment env)
                     (proc (apply #'start-file-process
@@ -430,8 +439,9 @@ once instead of a separate `--raw' and `--name-status' call."
   (let ((map (make-hash-table :test 'equal)))
     (with-temp-buffer
       (apply #'process-file "git" nil t nil
-             (append (magit-difftastic--raw-args diff-args)
-                     (when files (cons "--" files))))
+             (magit-difftastic--git-args
+              (append (magit-difftastic--raw-args diff-args)
+                      (when files (cons "--" files)))))
       (dolist (line (split-string (buffer-string) "\n" t))
         ;; A raw line is ":OMODE NMODE OID NID STATUS\tPATH" (rename/copy:
         ;; "...\tOLD\tNEW").  Combined (merge) diffs start with "::" and are
@@ -632,10 +642,11 @@ Uses CONTEXT context lines (default `magit-difftastic-apply-context').
 When STAGED is non-nil diff the index against HEAD."
   (with-temp-buffer
     (apply #'process-file "git" nil t nil
-           (append (list "--no-pager" "diff" "--no-ext-diff"
-                         (format "-U%d" (or context magit-difftastic-apply-context)))
-                   (when staged '("--cached"))
-                   (list "--" file)))
+           (magit-difftastic--git-args
+            (append (list "diff" "--no-ext-diff"
+                          (format "-U%d" (or context magit-difftastic-apply-context)))
+                    (when staged '("--cached"))
+                    (list "--" file))))
     (buffer-string)))
 
 (defun magit-difftastic--parse-diff (diff)
@@ -1143,8 +1154,9 @@ SPEC is (worktree) -- read from disk -- or (blob REV) -- `git show REV:FILE'
          (with-temp-buffer (insert-file-contents path) (buffer-string)))))
     (`(blob ,rev)
      (with-temp-buffer
-       (and (eq 0 (process-file "git" nil t nil "--no-pager" "show"
-                                (concat rev ":" file)))
+       (and (eq 0 (apply #'process-file "git" nil t nil
+                         (magit-difftastic--git-args
+                          (list "show" (concat rev ":" file)))))
             (buffer-string))))))
 
 (defun magit-difftastic--fontify-lines (mode text &optional range)
@@ -2135,7 +2147,8 @@ When nil, viewing a commit keeps Magit's stock rendering even while
 (defun magit-difftastic--git-lines (&rest args)
   "Run \"git ARGS...\" and return its non-empty output lines as a list."
   (with-temp-buffer
-    (apply #'process-file "git" nil t nil args)
+    (apply #'process-file "git" nil t nil
+           (magit-difftastic--git-args args))
     (split-string (buffer-string) "\n" t)))
 
 ;;; Whitespace-ignoring diff flags

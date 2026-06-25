@@ -212,6 +212,23 @@ element is one displayed chunk's body (the header line dropped)."
   (should (equal (magit-difftastic--chunk-start-line '("7 x")) "7"))
   (should-not (magit-difftastic--chunk-start-line '("no numbers" "here"))))
 
+;;;; Unit tests: git subprocess arguments ---------------------------------
+
+(ert-deftest magit-difftastic--git-args/adds-no-pager ()
+  "Internal git subprocesses should never use the user's pager."
+  (should (equal (magit-difftastic--git-args '("diff" "--name-only"))
+                 '("--no-pager" "diff" "--name-only"))))
+
+(ert-deftest magit-difftastic--git-args/preserves-existing-no-pager ()
+  "Do not duplicate `--no-pager' when callers already supplied it."
+  (should (equal (magit-difftastic--git-args '("--no-pager" "show" "HEAD"))
+                 '("--no-pager" "show" "HEAD"))))
+
+(ert-deftest magit-difftastic--git-args/moves-no-pager-before-subcommand ()
+  "Git only honors `--no-pager' before the subcommand."
+  (should (equal (magit-difftastic--git-args '("diff" "--no-pager" "--name-only"))
+                 '("--no-pager" "diff" "--name-only"))))
+
 ;;;; Unit tests: evil key gating (issue #4) --------------------------------
 
 (ert-deftest magit-difftastic--set-evil-keys/honors-option ()
