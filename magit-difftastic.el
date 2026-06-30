@@ -2131,6 +2131,15 @@ When nil, viewing a commit keeps Magit's stock rendering even while
   :type 'boolean
   :group 'magit-difftastic)
 
+(defcustom magit-difftastic-hidden-revision-buffers nil
+  "Whether to render hidden `magit-revision-mode' buffers with difftastic.
+Magit can refresh revision buffers that are not displayed in any window, for
+example while updating the revision buffer associated with another Magit view.
+When this option is nil, such hidden refreshes use Magit's stock revision diff
+instead of running difftastic."
+  :type 'boolean
+  :group 'magit-difftastic)
+
 ;; These are buffer-local variables Magit sets in its diff/revision buffers;
 ;; declare them special to keep the byte-compiler quiet.
 (defvar magit-buffer-range)
@@ -2290,6 +2299,8 @@ Falls back to ORIG (called with ARGS) when difftastic should not handle the
 current `magit-revision-mode' buffer.  Like Magit's own inserter, the per-file
 sections are inserted directly (no extra wrapping section)."
   (let ((ctx (and magit-difftastic-revision-buffers
+                  (or magit-difftastic-hidden-revision-buffers
+                      (get-buffer-window (current-buffer) t))
                   (ignore-errors (magit-difftastic--revision-context)))))
     (if ctx
         (magit-difftastic--insert-file-sections (cdr ctx) (car ctx))

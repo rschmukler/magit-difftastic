@@ -759,6 +759,43 @@ the render pump must not be able to re-enter `magit-refresh'."
         (magit-difftastic--render-files jobs width))
       (should observed))))
 
+;;;; Unit tests: revision-buffer visibility --------------------------------
+
+(ert-deftest magit-difftastic--insert-revision-diff-advice/hidden-falls-back ()
+  "Hidden revision buffers use the stock inserter by default."
+  (let ((magit-difftastic-revision-buffers t)
+        (magit-difftastic-hidden-revision-buffers nil)
+        (called-stock nil)
+        (called-context nil)
+        (called-insert nil))
+    (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) nil))
+              ((symbol-function 'magit-difftastic--revision-context)
+               (lambda () (setq called-context t) '(:context . ("file"))))
+              ((symbol-function 'magit-difftastic--insert-file-sections)
+               (lambda (&rest _) (setq called-insert t))))
+      (magit-difftastic--insert-revision-diff-advice
+       (lambda (&rest _) (setq called-stock t))))
+    (should called-stock)
+    (should-not called-context)
+    (should-not called-insert)))
+
+(ert-deftest magit-difftastic--insert-revision-diff-advice/hidden-option-renders ()
+  "Hidden revision buffers can still render with difftastic when opted in."
+  (let ((magit-difftastic-revision-buffers t)
+        (magit-difftastic-hidden-revision-buffers t)
+        (called-stock nil)
+        (called-insert nil))
+    (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) nil))
+              ((symbol-function 'magit-difftastic--revision-context)
+               (lambda () '(:context . ("file"))))
+              ((symbol-function 'magit-difftastic--insert-file-sections)
+               (lambda (files context)
+                 (setq called-insert (list files context)))))
+      (magit-difftastic--insert-revision-diff-advice
+       (lambda (&rest _) (setq called-stock t))))
+    (should-not called-stock)
+    (should (equal called-insert '(("file") :context)))))
+
 ;;;; Unit tests: render cache ----------------------------------------------
 
 (ert-deftest magit-difftastic--cache-key/direct-and-nil ()
