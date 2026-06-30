@@ -343,6 +343,7 @@ a synchronous render."
          (max-jobs (magit-difftastic--max-jobs))
          (running 0)
          (pending (length jobs))
+         (render-processes nil)
          ;; difft is selected purely through the environment (GIT_EXTERNAL_DIFF
          ;; etc.); the same env is reused for every process in the group.
          (env (difftastic--build-git-process-environment
@@ -358,11 +359,13 @@ a synchronous render."
                     (proc (apply #'start-file-process
                                  "magit-difftastic-render" buf "git" args)))
                (cl-incf running)
+               (push proc render-processes)
                (set-process-query-on-exit-flag proc nil)
                (set-process-sentinel
                 proc
                 (lambda (p _event)
                   (unless (process-live-p p)
+                    (setq render-processes (delq p render-processes))
                     (let ((b (process-buffer p)))
                       (when (buffer-live-p b)
                         (with-current-buffer b
@@ -377,14 +380,17 @@ a synchronous render."
       (launch)
       ;; Pump the event loop until every sentinel has fired.  We run inside a
       ;; `magit-refresh', and `accept-process-output' with a nil process drains
-      ;; the whole event loop, so a foreign sentinel/timer can fire here and call
-      ;; `magit-refresh' -- which re-enters this renderer and pumps again: an
-      ;; unbounded refresh->render loop that freezes Emacs (#6).  Binding
-      ;; `magit-inhibit-refresh' (refresh's only reentrancy guard) makes any such
-      ;; nested refresh a no-op; the outer refresh already reads fresh state.
+      ;; output from every Emacs subprocess.  A foreign sentinel/timer firing
+      ;; here can slow the render wait or try to refresh Magit while we are
+      ;; already refreshing (#6).  Only accept output from the difft processes we
+      ;; started, and bind `magit-inhibit-refresh' so any nested refresh request
+      ;; remains a no-op; the outer refresh already reads fresh state.
       (let ((magit-inhibit-refresh t))
         (while (> pending 0)
-          (accept-process-output nil 0.05))))
+          (if render-processes
+              (dolist (proc (copy-sequence render-processes))
+                (accept-process-output proc 0.01 nil t))
+            (sleep-for 0.01)))))
     results))
 
 ;;; Render cache

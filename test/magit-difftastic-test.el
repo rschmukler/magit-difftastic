@@ -736,7 +736,7 @@ and every requested file must be present in the returned hash."
                         f magit-difftastic--diff-base width)))))))
 
 (ert-deftest magit-difftastic-integration/render-files-inhibits-refresh ()
-  "`--render-files' binds `magit-inhibit-refresh' while pumping the event loop.
+  "`--render-files' binds `magit-inhibit-refresh' while pumping render processes.
 Regression for the discard freeze (#6): a foreign sentinel/timer firing during
 the render pump must not be able to re-enter `magit-refresh'."
   (skip-unless dst-test--have-tools)
@@ -748,16 +748,22 @@ the render pump must not be able to re-enter `magit-refresh'."
            (width (magit-difftastic--width))
            (jobs (mapcar (lambda (f) (cons f magit-difftastic--diff-base)) files))
            (observed 'unset)
+           (process-args nil)
            (real (symbol-function 'accept-process-output)))
-      ;; The pump calls `accept-process-output' at least once to drain the
-      ;; sentinels; capture `magit-inhibit-refresh' as seen from inside it.
+      ;; The pump calls `accept-process-output' to drain the render processes;
+      ;; capture `magit-inhibit-refresh' and ensure the wait is scoped to those
+      ;; processes instead of globally accepting output with a nil process.
       (cl-letf (((symbol-function 'accept-process-output)
                  (lambda (&rest args)
                    (when (eq observed 'unset)
                      (setq observed magit-inhibit-refresh))
+                   (push (car args) process-args)
                    (apply real args))))
         (magit-difftastic--render-files jobs width))
-      (should observed))))
+      (should observed)
+      (should process-args)
+      (should-not (memq nil process-args))
+      (should (cl-every #'processp process-args)))))
 
 ;;;; Unit tests: render cache ----------------------------------------------
 
