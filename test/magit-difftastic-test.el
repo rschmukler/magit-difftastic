@@ -759,6 +759,34 @@ the render pump must not be able to re-enter `magit-refresh'."
         (magit-difftastic--render-files jobs width))
       (should observed))))
 
+(ert-deftest magit-difftastic-integration/render-files-completes-without-sentinels ()
+  "`--render-files' finishes from its wait loop, not from process sentinels.
+Regression for the first-render freeze (#9): even when no render process's
+sentinel does any work, every job must still be collected with its full output,
+because the wait loop drains each process to EOF itself rather than waiting for
+a sentinel that the surrounding `magit-refresh' may never schedule."
+  (skip-unless dst-test--have-tools)
+  (dst-test--with-repo '(("a.txt" . "alpha\nbravo\n")
+                         ("b.txt" . "one\ntwo\n"))
+      '(("a.txt" . "alpha\nBRAVO\n")
+        ("b.txt" . "ONE\ntwo\n"))
+    (let* ((files '("a.txt" "b.txt"))
+           (width (magit-difftastic--width))
+           (jobs (mapcar (lambda (f) (cons f magit-difftastic--diff-base)) files))
+           (real (symbol-function 'set-process-sentinel)))
+      ;; Force every render process to a do-nothing sentinel, so completion can
+      ;; only come from the wait loop draining the process itself.  Reverting to
+      ;; sentinel-driven completion would livelock here and trip the timeout.
+      (cl-letf (((symbol-function 'set-process-sentinel)
+                 (lambda (proc _sentinel) (funcall real proc #'ignore))))
+        (let ((rendered (with-timeout (30 (ert-fail "render-files livelocked"))
+                          (magit-difftastic--render-files jobs width))))
+          (should (= (hash-table-count rendered) (length files)))
+          (dolist (f files)
+            (should (equal (gethash f rendered)
+                           (magit-difftastic--render-raw
+                            f magit-difftastic--diff-base width)))))))))
+
 ;;;; Unit tests: render cache ----------------------------------------------
 
 (ert-deftest magit-difftastic--cache-key/direct-and-nil ()

@@ -342,13 +342,28 @@ a synchronous render."
          (queue (copy-sequence jobs))
          (max-jobs (magit-difftastic--max-jobs))
          (running 0)
-         (pending (length jobs))
+         ;; (PROC . FILE) for every launched-but-not-yet-collected render.
+         (active nil)
          ;; difft is selected purely through the environment (GIT_EXTERNAL_DIFF
          ;; etc.); the same env is reused for every process in the group.
          (env (difftastic--build-git-process-environment
                width (list "--display" magit-difftastic-display))))
     (cl-labels
-        ((launch ()
+        ((collect (proc)
+           ;; PROC has been drained to EOF by the wait loop, so its buffer holds
+           ;; the file's complete difft output; record it and free the slot.
+           (when-let* ((entry (assq proc active)))
+             (setq active (delq entry active))
+             (let ((file (cdr entry))
+                   (buf (process-buffer proc)))
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (puthash file
+                            (difftastic--ansi-color-apply (buffer-string))
+                            results))
+                 (kill-buffer buf)))
+             (cl-decf running)))
+         (launch ()
            (while (and queue (< running max-jobs))
              (let* ((job (pop queue))
                     (file (car job))
@@ -358,33 +373,33 @@ a synchronous render."
                     (proc (apply #'start-file-process
                                  "magit-difftastic-render" buf "git" args)))
                (cl-incf running)
+               (push (cons proc file) active)
                (set-process-query-on-exit-flag proc nil)
-               (set-process-sentinel
-                proc
-                (lambda (p _event)
-                  (unless (process-live-p p)
-                    (let ((b (process-buffer p)))
-                      (when (buffer-live-p b)
-                        (with-current-buffer b
-                          (puthash file
-                                   (difftastic--ansi-color-apply (buffer-string))
-                                   results))
-                        (kill-buffer b)))
-                    (cl-decf running)
-                    (cl-decf pending)
-                    ;; A finished slot frees room for the next queued job.
-                    (launch))))))))
+               ;; Completion is driven from the wait loop below, but a process
+               ;; with no sentinel runs Emacs's default one, which writes a
+               ;; "Process ... finished" line into the render buffer; silence it.
+               (set-process-sentinel proc #'ignore)))))
       (launch)
-      ;; Pump the event loop until every sentinel has fired.  We run inside a
-      ;; `magit-refresh', and `accept-process-output' with a nil process drains
-      ;; the whole event loop, so a foreign sentinel/timer can fire here and call
-      ;; `magit-refresh' -- which re-enters this renderer and pumps again: an
-      ;; unbounded refresh->render loop that freezes Emacs (#6).  Binding
-      ;; `magit-inhibit-refresh' (refresh's only reentrancy guard) makes any such
-      ;; nested refresh a no-op; the outer refresh already reads fresh state.
+      ;; Wait on the render processes themselves rather than on sentinel
+      ;; scheduling.  The old loop pumped the whole event loop with
+      ;; `accept-process-output' and a nil process, then relied on each difft
+      ;; process's *sentinel* to record completion.  Deep inside the first
+      ;; `magit-refresh' those sentinels are not reliably scheduled, so the loop
+      ;; never observed completion and spun at 100% CPU until `C-g' -- even
+      ;; though the output already sat in the process buffers (#9).
+      ;; `accept-process-output' given a *specific* process instead returns nil
+      ;; only once that process has exited and Emacs has read all of its output,
+      ;; so draining each process this way is both deterministic (no livelock)
+      ;; and complete (no truncated buffer).  `magit-inhibit-refresh' still
+      ;; neutralises any foreign sentinel/timer that re-enters `magit-refresh'
+      ;; during the wait -- the reentrancy freeze of #6.
       (let ((magit-inhibit-refresh t))
-        (while (> pending 0)
-          (accept-process-output nil 0.05))))
+        (while active
+          (let ((proc (caar active)))
+            (while (accept-process-output proc))
+            (collect proc)
+            ;; A finished slot frees room for the next queued job.
+            (launch)))))
     results))
 
 ;;; Render cache
