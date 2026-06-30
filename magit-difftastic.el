@@ -343,12 +343,31 @@ a synchronous render."
          (max-jobs (magit-difftastic--max-jobs))
          (running 0)
          (pending (length jobs))
+         (active nil)
          ;; difft is selected purely through the environment (GIT_EXTERNAL_DIFF
          ;; etc.); the same env is reused for every process in the group.
          (env (difftastic--build-git-process-environment
                width (list "--display" magit-difftastic-display))))
     (cl-labels
-        ((launch ()
+        ((finish (p)
+           (when-let* ((entry (assq p active)))
+             (setq active (delq entry active))
+             (let ((file (cdr entry))
+                   (b (process-buffer p)))
+               (when (buffer-live-p b)
+                 (with-current-buffer b
+                   (when (eq (process-status p) 'exit)
+                     (puthash file
+                              (difftastic--ansi-color-apply (buffer-string))
+                              results)))
+                 (kill-buffer b)))
+             (cl-decf running)
+             (cl-decf pending)))
+         (finish-done ()
+           (dolist (entry (copy-sequence active))
+             (unless (process-live-p (car entry))
+               (finish (car entry)))))
+         (launch ()
            (while (and queue (< running max-jobs))
              (let* ((job (pop queue))
                     (file (car job))
@@ -358,22 +377,14 @@ a synchronous render."
                     (proc (apply #'start-file-process
                                  "magit-difftastic-render" buf "git" args)))
                (cl-incf running)
+               (push (cons proc file) active)
                (set-process-query-on-exit-flag proc nil)
                (set-process-sentinel
                 proc
                 (lambda (p _event)
-                  (unless (process-live-p p)
-                    (let ((b (process-buffer p)))
-                      (when (buffer-live-p b)
-                        (with-current-buffer b
-                          (puthash file
-                                   (difftastic--ansi-color-apply (buffer-string))
-                                   results))
-                        (kill-buffer b)))
-                    (cl-decf running)
-                    (cl-decf pending)
-                    ;; A finished slot frees room for the next queued job.
-                    (launch))))))))
+                  (finish p)
+                  ;; A finished slot frees room for the next queued job.
+                  (launch)))))))
       (launch)
       ;; Pump the event loop until every sentinel has fired.  We run inside a
       ;; `magit-refresh', and `accept-process-output' with a nil process drains
@@ -384,7 +395,13 @@ a synchronous render."
       ;; nested refresh a no-op; the outer refresh already reads fresh state.
       (let ((magit-inhibit-refresh t))
         (while (> pending 0)
-          (accept-process-output nil 0.05))))
+          (accept-process-output nil 0.05)
+          ;; Do not rely solely on sentinels to update `pending'.  In some
+          ;; refresh paths Emacs has already collected the process output but the
+          ;; sentinel does not run until user input interrupts the wait; polling
+          ;; completed processes here lets the render finish immediately.
+          (finish-done)
+          (launch))))
     results))
 
 ;;; Render cache
