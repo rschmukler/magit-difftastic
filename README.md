@@ -18,8 +18,9 @@ split into collapsible per-chunk sub-sections with a native-looking
 
 ## Features
 
-- **In-place difftastic rendering** — replaces Magit's diff sections, using
-  difftastic's colour vectors so it matches `difftastic-magit-diff`.
+- **In-place difftastic rendering** — replaces Magit's diff sections, with
+  added/removed faces that follow the chunk at point like Magit's hunks (see
+  [Faces](#faces)).
 - **Multi-level staging** — `s` / `u` / `k` work on the whole **file**, a single
   **chunk**, or just the **selected lines**, mapped back onto real git hunks so
   every applied patch is valid.
@@ -161,6 +162,30 @@ Evil is absent, this is skipped entirely — no hard dependency.
 | `magit-difftastic-revision-buffers`     | `t`          | Render `magit-revision-mode` buffers (viewing a commit) with difftastic chunks. |
 | `magit-difftastic-default-rendering`    | `difftastic` | Renderer files start with in the status/diff/revision buffers: `difftastic` or `stock`. `C-c C-d` toggles the file at point relative to this default; `C-u C-c C-d` toggles the whole buffer. Changing it clears the per-buffer toggles. |
 | `magit-difftastic-toggle-rendering-key` | `"C-c C-d"`  | Key bound on difftastic/stock sections to `magit-difftastic-toggle-file-rendering` (switch the file at point between difftastic and stock Magit rendering). `nil` binds no key. |
+
+### Faces
+
+Text difftastic marks as added or removed uses these faces. Like Magit's hunks,
+the chunk at point (or every chunk in the file or region at point) switches to
+the `-highlight` variants, unless `magit-diff-highlight-hunk-body` is `nil`.
+
+| Face                                  | Inherits from                  |
+|---------------------------------------|--------------------------------|
+| `magit-difftastic-added`              | `magit-diff-added`             |
+| `magit-difftastic-added-highlight`    | `magit-diff-added-highlight`   |
+| `magit-difftastic-removed`            | `magit-diff-removed`           |
+| `magit-difftastic-removed-highlight`  | `magit-diff-removed-highlight` |
+| `magit-difftastic-refine-added`       | `diff-refine-added`            |
+| `magit-difftastic-refine-removed`     | `diff-refine-removed`          |
+
+The `refine` faces apply when `magit-diff-refine-hunk` is non-nil, to files
+difftastic diffs as plain text (unrecognised languages, or files over
+`DFT_BYTE_LIMIT`). There difftastic shows whole changed lines and emphasises the
+words that changed; those words get the `refine` faces, in every chunk. For
+recognised languages difftastic already colours only the changed tokens.
+
+These faces need Emacs 29 or later; on Emacs 28 the colours come from
+difftastic's colour vectors and don't change with the chunk at point.
 
 ### Background rendering
 

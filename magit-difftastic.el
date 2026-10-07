@@ -119,7 +119,9 @@
 ;;   `magit-mode-map' an overriding map so a section-keymap `[remap ...]' never
 ;;   wins -- per-chunk commands are wired by ADVISING the magit commands
 ;;   themselves (see the "Advice" commentary below), which is binding- and
-;;   evil-state-agnostic.
+;;   evil-state-agnostic.  For the same reason a chunk is a
+;;   `magit-difftastic-hunk-section', whose highlighting covers only its
+;;   heading: Magit's default highlight overlay would hide difft's colours.
 ;;
 ;; KNOWN LIMITATIONS:
 ;;   - Region staging operates within a single chunk at a time (the chunk at
@@ -232,6 +234,32 @@ for understated headings, `magit-section-heading' for a bolder look, or
   :type 'face
   :group 'magit-difftastic)
 
+(defface magit-difftastic-added '((t :inherit magit-diff-added))
+  "Face for text difftastic marks as added."
+  :group 'magit-difftastic)
+
+(defface magit-difftastic-added-highlight
+  '((t :inherit magit-diff-added-highlight))
+  "Face for text difftastic marks as added, in the current chunk."
+  :group 'magit-difftastic)
+
+(defface magit-difftastic-removed '((t :inherit magit-diff-removed))
+  "Face for text difftastic marks as removed."
+  :group 'magit-difftastic)
+
+(defface magit-difftastic-removed-highlight
+  '((t :inherit magit-diff-removed-highlight))
+  "Face for text difftastic marks as removed, in the current chunk."
+  :group 'magit-difftastic)
+
+(defface magit-difftastic-refine-added '((t :inherit diff-refine-added))
+  "Face for the words that changed within an added line of a text diff."
+  :group 'magit-difftastic)
+
+(defface magit-difftastic-refine-removed '((t :inherit diff-refine-removed))
+  "Face for the words that changed within a removed line of a text diff."
+  :group 'magit-difftastic)
+
 (defcustom magit-difftastic-width 'window
   "Column width passed to difft, controlling where it wraps long lines.
 
@@ -303,6 +331,70 @@ synchronous section-insertion pass reads each file's already-computed difft
 output instead of spawning a subprocess inline.  A cache miss falls back to a
 direct synchronous render, so the cache is purely an optimisation.")
 
+(defconst magit-difftastic--change-faces
+  '((added   magit-difftastic-added   . magit-difftastic-added-highlight)
+    (removed magit-difftastic-removed . magit-difftastic-removed-highlight))
+  "Alist of (CHANGE PLAIN-FACE . HIGHLIGHT-FACE) for each kind of change.")
+
+(defun magit-difftastic--change-face (change highlight)
+  "Return the face for CHANGE (`added' or `removed'), highlighted if HIGHLIGHT."
+  (let ((faces (alist-get change magit-difftastic--change-faces)))
+    (if highlight (cdr faces) (car faces))))
+
+(defun magit-difftastic--face-vec-change (face-vec)
+  "Return `added' or `removed' when FACE-VEC has difft's green or red foreground.
+FACE-VEC is as in `ansi-color--face-vec-face'."
+  (let ((fg (cadr face-vec)))
+    (and (integerp fg) (< fg 16)
+         (pcase (mod fg 8) (1 'removed) (2 'added)))))
+
+(defun magit-difftastic--face-vec-face (orig face-vec)
+  "Around advice for `ansi-color--face-vec-face' while applying difft colours.
+Added and removed text gets `magit-difftastic-added' or
+`magit-difftastic-removed' plus FACE-VEC's other attributes (bold, ...); any
+other FACE-VEC is coloured as `difftastic' does.  ORIG is the advised function."
+  (if-let* ((change (magit-difftastic--face-vec-change face-vec)))
+      (let ((rest (funcall orig (list (car face-vec) nil (nth 2 face-vec)))))
+        (cons (magit-difftastic--change-face change nil)
+              (magit-difftastic--face-list rest)))
+    (if (fboundp 'difftastic--ansi-color-add-background-cached)
+        (difftastic--ansi-color-add-background-cached orig face-vec)
+      (funcall orig face-vec))))
+
+(defun magit-difftastic--mark-changes (string)
+  "Put `magit-difftastic-change' on STRING's added and removed text; return it."
+  (let ((pos 0)
+        (end (length string)))
+    (while (< pos end)
+      (let* ((next (or (next-single-property-change pos 'font-lock-face string)
+                       end))
+             (faces (magit-difftastic--face-list
+                     (get-text-property pos 'font-lock-face string)))
+             (change (car (cl-find-if (lambda (entry) (memq (cadr entry) faces))
+                                      magit-difftastic--change-faces))))
+        (when change
+          (put-text-property pos next 'magit-difftastic-change change string))
+        (setq pos next)))
+    string))
+
+(defun magit-difftastic--ansi-color-apply (string)
+  "Return STRING with difft's ANSI colours turned into faces.
+Added and removed text uses `magit-difftastic-added' and
+`magit-difftastic-removed' and is marked with the `magit-difftastic-change'
+property, so its colours can follow the current chunk.  Without
+`ansi-color--face-vec-face' (before Emacs 29) this is
+`difftastic--ansi-color-apply'."
+  (if (not (fboundp 'ansi-color--face-vec-face))
+      (difftastic--ansi-color-apply string)
+    (let ((ansi-color-normal-colors-vector difftastic-normal-colors-vector)
+          (ansi-color-bright-colors-vector difftastic-bright-colors-vector))
+      (advice-add 'ansi-color--face-vec-face :around
+                  #'magit-difftastic--face-vec-face)
+      (unwind-protect
+          (magit-difftastic--mark-changes (ansi-color-apply string))
+        (advice-remove 'ansi-color--face-vec-face
+                       #'magit-difftastic--face-vec-face)))))
+
 (defun magit-difftastic--render-raw (file diff-args width)
   "Run `git DIFF-ARGS -- FILE' through difft at WIDTH and return propertized text.
 Synchronous; used as the fallback when no pre-warmed entry exists (see
@@ -319,9 +411,7 @@ Synchronous; used as the fallback when no pre-warmed entry exists (see
                  (apply #'process-file "git" nil t nil
                         (append diff-args (list "--" file))))
                (buffer-string))))
-    ;; Turn difft's ANSI escapes into propertized text using difftastic's
-    ;; own colour vectors (so it matches `difftastic-magit-diff').
-    (difftastic--ansi-color-apply raw)))
+    (magit-difftastic--ansi-color-apply raw)))
 
 (defun magit-difftastic--file-diff-string (file diff-args)
   "Return the difftastic-rendered, fontified diff STRING for FILE.
@@ -381,7 +471,7 @@ a synchronous render."
                (when (buffer-live-p buf)
                  (with-current-buffer buf
                    (puthash file
-                            (difftastic--ansi-color-apply (buffer-string))
+                            (magit-difftastic--ansi-color-apply (buffer-string))
                             results))
                  (kill-buffer buf)))
              (cl-decf running)))
@@ -1694,7 +1784,7 @@ ORIG and ARGS as there."
 Difftastic inline rows are prefixed with a right-aligned line number."
   (cl-some (lambda (l)
              (when (string-match "\\`[ \t]*\\([0-9]+\\)" l)
-               (match-string 1 l)))
+               (match-string-no-properties 1 l)))
            body-lines))
 
 ;;; Cross-chunk column alignment
@@ -1814,13 +1904,159 @@ preserved.  Single-column chunks (no right column) are returned unchanged."
                 (forward-line))
               (nreverse out))))))))
 
-(defun magit-difftastic--insert-chunk (body-lines file context)
+(defclass magit-difftastic-hunk-section (magit-section) ()
+  "Section for one difftastic chunk (type `magit-difftastic-hunk').")
+
+(setf (alist-get 'magit-difftastic-hunk magit--section-type-alist)
+      'magit-difftastic-hunk-section)
+
+(declare-function magit-section-make-overlay "magit-section" (start end face))
+
+(defun magit-difftastic--highlight-range (start end face)
+  "Add a section highlight overlay with FACE from START to END."
+  (if (fboundp 'magit-section-highlight-range)
+      (magit-section-highlight-range start end face)
+    ;; Magit before 4.3.6.
+    (magit-section-make-overlay start end face)))
+
+(defun magit-difftastic--highlight-advice (orig section &rest args)
+  "Around advice for `magit-section-highlight' on difftastic chunks.
+Highlights only the heading of SECTION (or of each section in the selection,
+the first of ARGS on Magit before 4.3.6), so difftastic's colours stay visible
+in the body.  Other sections are passed to ORIG unchanged."
+  ;; Magit's own highlight overlays the whole body with
+  ;; `magit-section-highlight', whose background hides difft's.
+  (if (not (cl-typep section 'magit-difftastic-hunk-section))
+      (apply orig section args)
+    (let ((selection (car args)))
+      (dolist (s (or selection (list section)))
+        (with-slots (start content end heading-highlight-face) s
+          (magit-difftastic--highlight-range start (or content end)
+                                             heading-highlight-face)))
+      ;; Only Magit before 4.3.6 passes a selection, and expects it marked.
+      (when selection
+        (with-no-warnings
+          (magit-section-highlight-selection nil selection)))
+      (unless (magit-difftastic--magit-paints-p)
+        (dolist (s (or selection (list section)))
+          (magit-difftastic--highlight-body s)))
+      t)))
+
+;; Magit before 4.3.6 only.
+(defvar magit-section-unhighlight-sections)
+;; Magit 4.3.6 and later only.
+(defvar magit-section-focused-sections)
+
+(defun magit-difftastic--magit-paints-p ()
+  "Return non-nil when Magit repaints focused sections (Magit 4.3.6 and later)."
+  (slot-exists-p 'magit-section 'painted))
+
+(defun magit-difftastic--recolour (beg end change highlight)
+  "Switch the CHANGE face from BEG to END to its HIGHLIGHT variant, or back."
+  (let ((from (magit-difftastic--change-face change (not highlight)))
+        (to (magit-difftastic--change-face change highlight)))
+    (while (< beg end)
+      (let ((next (next-single-property-change beg 'font-lock-face nil end))
+            (faces (magit-difftastic--face-list
+                    (get-text-property beg 'font-lock-face))))
+        (when (memq from faces)
+          (put-text-property beg next 'font-lock-face
+                             (cl-substitute to from faces)))
+        (setq beg next)))))
+
+(defconst magit-difftastic--refine-faces
+  '((added   . magit-difftastic-refine-added)
+    (removed . magit-difftastic-refine-removed))
+  "Alist of (CHANGE . REFINE-FACE) for each kind of change.")
+
+(defun magit-difftastic--gutters (beg end)
+  "Return the line-number gutters in the chunk from BEG to END.
+Each element is (START . END) of one gutter, its trailing space included."
+  (let (gutters)
+    (dolist (line (magit-difftastic--parse-chunk-bounds beg end))
+      (pcase-dolist (`(,_ ,gbeg ,gend) (cdr line))
+        (when (and (integerp gbeg) (integerp gend))
+          (push (cons gbeg (1+ gend)) gutters))))
+    gutters))
+
+(defun magit-difftastic--refine-chunk (beg end)
+  "Give the changed words in the text-diff chunk from BEG to END refine faces.
+difft shows a changed line in the plain added or removed colour and the words
+that changed in bold.  Those words get `magit-difftastic-refine-added' or
+`magit-difftastic-refine-removed' instead, without the bold.  Line-number
+gutters, which difft also bolds, are left alone."
+  (let ((gutters (magit-difftastic--gutters beg end))
+        (pos beg))
+    (while (< pos end)
+      (let ((next (next-single-property-change pos 'font-lock-face nil end))
+            (change (get-text-property pos 'magit-difftastic-change))
+            (faces (magit-difftastic--face-list
+                    (get-text-property pos 'font-lock-face))))
+        (when (and change
+                   (memq 'ansi-color-bold faces)
+                   (not (cl-some (lambda (g) (and (<= (car g) pos) (< pos (cdr g))))
+                                 gutters)))
+          (let ((drop (list 'ansi-color-bold
+                            (magit-difftastic--change-face change nil))))
+            (put-text-property
+             pos next 'font-lock-face
+             (cons (alist-get change magit-difftastic--refine-faces)
+                   (cl-remove-if (lambda (f) (memq f drop)) faces)))))
+        (setq pos next)))))
+
+(defun magit-difftastic--paint-chunk (section highlight)
+  "Colour SECTION's added and removed text, highlighted when HIGHLIGHT.
+Highlighting is skipped when `magit-diff-highlight-hunk-body' is nil."
+  (let ((highlight (and highlight magit-diff-highlight-hunk-body))
+        (pos (or (oref section content) (oref section end)))
+        (end (oref section end)))
+    (with-silent-modifications
+      (while (< pos end)
+        (let ((next (next-single-property-change
+                     pos 'magit-difftastic-change nil end)))
+          (when-let* ((change (get-text-property pos 'magit-difftastic-change)))
+            (magit-difftastic--recolour pos next change highlight))
+          (setq pos next))))))
+
+(defun magit-difftastic--set-painted (section state)
+  "Record SECTION's paint STATE (`plain' or `highlight') for Magit."
+  ;; Called only when the slot exists; avoids compile-time slot validation
+  ;; against older Magit classes.
+  (funcall (symbol-function 'eieio-oset) section 'painted state))
+
+(cl-defmethod magit-section-paint ((section magit-difftastic-hunk-section)
+                                   highlight)
+  "Colour SECTION's added and removed text, highlighted when HIGHLIGHT."
+  (magit-difftastic--paint-chunk section highlight)
+  (magit-difftastic--set-painted section (if highlight 'highlight 'plain)))
+
+(defun magit-difftastic--highlight-body (section)
+  "Highlight SECTION's added and removed text (Magit before 4.3.6).
+A section that was already highlighted is kept as is."
+  (unless (oref section hidden)
+    (cl-pushnew section magit-section-highlighted-sections)
+    (if (memq section magit-section-unhighlight-sections)
+        (setq magit-section-unhighlight-sections
+              (delq section magit-section-unhighlight-sections))
+      (magit-difftastic--paint-chunk section t))))
+
+(defun magit-difftastic--unhighlight (section _selection)
+  "Restore the plain colours of SECTION when it is a difftastic chunk.
+For `magit-section-unhighlight-hook' (Magit before 4.3.6)."
+  (when (cl-typep section 'magit-difftastic-hunk-section)
+    (magit-difftastic--paint-chunk section nil)
+    t))
+
+(defun magit-difftastic--insert-chunk (body-lines file context &optional refine)
   "Insert one collapsible chunk section from BODY-LINES (difft header removed).
 FILE is the repo-relative path.  CONTEXT is the diff context plist (see
 `magit-difftastic--insert-file-sections'); its `:staged' and `:stageable'
 entries are stored on the section value so the staging commands can rebuild the
-corresponding git hunk.  The chunk's line numbers are not stored: the staging
-and visiting commands read them from the section's rendered gutters (see
+corresponding git hunk.  When REFINE is non-nil, the words difft emphasises
+within changed lines get the refine faces (see
+`magit-difftastic--refine-chunk').  The chunk's line numbers are not stored:
+the staging and visiting commands read them from the section's rendered
+gutters (see
 `magit-difftastic--chunk-displayed-lines'), which stays aligned with what the
 section displays even when difft's text display merges several JSON chunks."
   ;; Drop leading/trailing blank lines that difft puts between chunks.
@@ -1854,6 +2090,10 @@ section displays even when difft's text display merges several JSON chunks."
           ;; Avoid compile-time slot validation against older Magit classes.
           (funcall (symbol-function 'eieio-oset)
                    section 'heading-selection-face 'magit-diff-hunk-heading-selection))
+        ;; The body is inserted with plain colours; Magit repaints it when
+        ;; the chunk gains or loses focus (see `magit-section-paint').
+        (when (magit-difftastic--magit-paints-p)
+          (magit-difftastic--set-painted section 'plain))
         ;; Set the section keymap here rather than via `magit-insert-section':
         ;; the base `magit-section' `keymap' slot has no initarg, so passing
         ;; `:keymap' would signal `invalid-slot-name'.  It is applied later in
@@ -1871,6 +2111,8 @@ section displays even when difft's text display merges several JSON chunks."
                         'font-lock-face magit-difftastic-chunk-heading-face))
           (dolist (l body-lines)
             (insert l "\n"))
+          (when refine
+            (magit-difftastic--refine-chunk heading-start (point)))
           ;; Syntax highlighting is applied once per file (across all chunks) by
           ;; `magit-difftastic--insert-chunks', so the file's source is fetched
           ;; and fontified a single time rather than once per chunk.
@@ -1898,14 +2140,27 @@ whitespace, which `difftastic--chunk-regexp' incorrectly rejects."
       (and (string-match-p (rx bos " ") line)
            (string-match-p magit-difftastic--chunk-header-trailer-re line))))
 
+(defun magit-difftastic--text-diff-p (rendered)
+  "Return non-nil when difft rendered RENDERED as a line-based text diff.
+That is the case when difft's first chunk header names the `Text' language,
+including when a size or parse limit made difft fall back to it."
+  ;; difft gives a file one language, so the first header is enough.
+  (when (string-match (rx bos (* "\n") (group (* nonl))) rendered)
+    (let ((line (match-string-no-properties 1 rendered)))
+      (and (magit-difftastic--chunk-header-line-p
+            (difftastic--chunk-regexp t) line)
+           (string-match-p (rx " --- Text" (or eol " (")) line)))))
+
 (defun magit-difftastic--insert-chunks (rendered file context)
   "Split RENDERED difftastic output for FILE into collapsible per-chunk sections.
 Difftastic's own `FILE --- N/M --- LANG' headers are consumed (not shown); each
 run of text between them becomes one displayed chunk section.  CONTEXT is the
 diff context plist threaded down to each chunk section."
-  (let ((sections nil))
+  (let ((sections nil)
+        (refine (and magit-diff-refine-hunk
+                     (magit-difftastic--text-diff-p rendered))))
     (dolist (body (magit-difftastic--split-chunk-bodies rendered))
-      (push (magit-difftastic--insert-chunk body file context) sections))
+      (push (magit-difftastic--insert-chunk body file context refine) sections))
     ;; Highlight the whole file in one pass: fetch and fontify each blob a single
     ;; time, bounded to the deepest line any chunk displays, then paint every
     ;; chunk from those shared vectors (see `magit-difftastic--apply-syntax-sections').
@@ -2209,6 +2464,9 @@ staging and visibility apply unchanged.  Falls back to difftastic rendering if
                   (dolist (entry ends)
                     (set-marker-insertion-type (car entry) (cdr entry)))
                   (set-buffer-modified-p modified))))
+            ;; The new chunks may be focused; Magit only recomputes focus
+            ;; before a command.
+            (setq magit-section-focused-sections nil)
             (setq magit-section-highlight-force-update t)))))))
 
 (defun magit-difftastic--lazy-rendered (request raw error)
@@ -2252,7 +2510,7 @@ staging and visibility apply unchanged.  Falls back to difftastic rendering if
          ((not (magit-difftastic--lazy-fresh-p request))
           (setf (magit-difftastic--lazy-file-state request) 'stale))
          (t
-          (let ((output (difftastic--ansi-color-apply raw)))
+          (let ((output (magit-difftastic--ansi-color-apply raw)))
             (setf (magit-difftastic--lazy-file-output request) output
                   (magit-difftastic--lazy-file-state request) 'ready)
             (magit-difftastic--cache-put
@@ -2965,6 +3223,11 @@ whole buffer."
   (if magit-difftastic-mode
       (progn
         (advice-add 'magit-section-show :after #'magit-difftastic--lazy-show)
+        (advice-add 'magit-section-highlight :around
+                    #'magit-difftastic--highlight-advice)
+        (unless (magit-difftastic--magit-paints-p)
+          (add-hook 'magit-section-unhighlight-hook
+                    #'magit-difftastic--unhighlight))
         (advice-add 'magit-refresh-buffer :around #'magit-difftastic--refresh-advice)
         (advice-add 'magit-insert-unstaged-changes :around
                     #'magit-difftastic--insert-unstaged-advice)
@@ -2982,6 +3245,8 @@ whole buffer."
         (magit-difftastic--set-toggle-key t))
     (magit-difftastic--async-cancel-all)
     (advice-remove 'magit-section-show #'magit-difftastic--lazy-show)
+    (advice-remove 'magit-section-highlight #'magit-difftastic--highlight-advice)
+    (remove-hook 'magit-section-unhighlight-hook #'magit-difftastic--unhighlight)
     (advice-remove 'magit-refresh-buffer #'magit-difftastic--refresh-advice)
     (advice-remove 'magit-insert-unstaged-changes
                    #'magit-difftastic--insert-unstaged-advice)

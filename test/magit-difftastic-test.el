@@ -940,6 +940,269 @@ still reads the same line numbers and `git apply' stages the right git hunks."
         (should-not (magit-difftastic--chunk-right-col body))
         (should (equal (magit-difftastic--align-chunk-lines body 80) body))))))
 
+;;;; Chunk highlighting (issue #3) -----------------------------------------
+
+;; Each exists on only some Magit versions; declared so test bindings are
+;; dynamic on any Magit.
+(defvar magit-section-selection-overlays)
+(defvar magit-section-unhighlight-sections)
+(defvar magit-section-unhighlight-hook)
+
+(defun dst-test--highlight (sections)
+  "Highlight SECTIONS (the current one first) as Magit's highlight update does.
+Magit 4.3.6+ highlights each selected section, then the selection; older Magit
+makes one call with the selection."
+  (let ((selection (and (cdr sections) sections)))
+    (if (fboundp 'magit-section-highlight-range)
+        (progn (mapc #'magit-section-highlight sections)
+               (when selection
+                 (magit-section-highlight-selection selection)))
+      (magit-section-highlight (car sections) selection))))
+
+(defun dst-test--overlays ()
+  "Return every live section highlight and selection overlay."
+  (append magit-section-highlight-overlays magit-section-selection-overlays))
+
+(defun dst-test--heading-highlighted-p (section)
+  "Return non-nil when SECTION's heading has the hunk heading highlight."
+  (cl-some (lambda (ov)
+             (and (= (overlay-start ov) (oref section start))
+                  (= (overlay-end ov) (oref section content))
+                  (eq (overlay-get ov 'font-lock-face)
+                      'magit-diff-hunk-heading-highlight)))
+           (dst-test--overlays)))
+
+(defun dst-test--body-overlaid-p (section)
+  "Return non-nil when any highlight overlay reaches into SECTION's body."
+  (cl-some (lambda (ov)
+             (and (< (overlay-start ov) (oref section end))
+                  (> (overlay-end ov) (oref section content))))
+           (dst-test--overlays)))
+
+(defmacro dst-test--with-highlight-advice (&rest body)
+  "Run BODY with `magit-difftastic--highlight-advice' installed."
+  (declare (indent 0))
+  `(let ((had-advice (advice-member-p #'magit-difftastic--highlight-advice
+                                      'magit-section-highlight)))
+     (unwind-protect
+         (progn
+           (advice-add 'magit-section-highlight :around
+                       #'magit-difftastic--highlight-advice)
+           ,@body)
+       (unless had-advice
+         (advice-remove 'magit-section-highlight
+                        #'magit-difftastic--highlight-advice)))))
+
+(defmacro dst-test--with-chunks (&rest body)
+  "Run BODY in a Magit section buffer holding two inserted difftastic chunks.
+`chunks' is bound to the two chunk sections, and the highlight advice is
+installed, for BODY."
+  (declare (indent 0))
+  `(with-temp-buffer
+     (magit-section-mode)
+     (let ((inhibit-read-only t)
+           (magit-difftastic--align-col nil)
+           (magit-difftastic-line-numbers t)
+           (magit-section-highlight-overlays nil)
+           (magit-section-selection-overlays nil)
+           (magit-section-highlighted-sections nil)
+           (magit-section-unhighlight-sections nil)
+           (magit-section-unhighlight-hook (list #'magit-difftastic--unhighlight))
+           (magit-diff-highlight-hunk-body t)
+           (line (magit-difftastic--ansi-color-apply
+                  "1 \e[92madded\e[0m \e[91mgone\e[0m")))
+       (magit-insert-section (root)
+         (magit-difftastic--insert-chunk (list line) "f.txt" nil)
+         (magit-difftastic--insert-chunk (list line) "f.txt" nil))
+       (let ((chunks (oref magit-root-section children)))
+         (dst-test--with-highlight-advice ,@body)))))
+
+(ert-deftest magit-difftastic-hunk-section/class-and-type ()
+  "Chunks are `magit-difftastic-hunk-section's whose type stays `magit-difftastic-hunk'."
+  (dst-test--with-chunks
+    (dolist (chunk chunks)
+      (should (cl-typep chunk 'magit-difftastic-hunk-section))
+      (should (eq (oref chunk type) 'magit-difftastic-hunk))
+      (should (eq (oref chunk keymap) 'magit-difftastic-hunk-section-map)))))
+
+(ert-deftest magit-difftastic-hunk-section/highlight-leaves-body ()
+  "Highlighting a chunk overlays only its heading, so difft's colours show."
+  (dst-test--with-chunks
+    (let ((chunk (car chunks)))
+      (dst-test--highlight (list chunk))
+      (should (dst-test--heading-highlighted-p chunk))
+      (should-not (dst-test--heading-highlighted-p (cadr chunks)))
+      (should-not (cl-some #'dst-test--body-overlaid-p chunks)))))
+
+(ert-deftest magit-difftastic-hunk-section/highlight-selection ()
+  "With several chunks selected, every heading is highlighted and no body."
+  (dst-test--with-chunks
+    (dst-test--highlight chunks)
+    (should (cl-every #'dst-test--heading-highlighted-p chunks))
+    (should-not (cl-some #'dst-test--body-overlaid-p chunks))))
+
+;;;; Change faces (issue #3) -----------------------------------------------
+
+(defun dst-test--focus (sections)
+  "Update highlighting as Magit does when SECTIONS become the focused ones.
+SECTIONS nil means nothing is focused."
+  (mapc #'delete-overlay magit-section-highlight-overlays)
+  (setq magit-section-highlight-overlays nil)
+  (if (magit-difftastic--magit-paints-p)
+      (progn
+        (when sections (dst-test--highlight sections))
+        (dolist (s (cl-union magit-section-highlighted-sections sections))
+          (when (slot-boundp s 'painted)
+            (magit-section-update-paint s sections))))
+    (setq magit-section-unhighlight-sections magit-section-highlighted-sections
+          magit-section-highlighted-sections nil)
+    (when sections (dst-test--highlight sections))
+    (dolist (s magit-section-unhighlight-sections)
+      (run-hook-with-args-until-success 'magit-section-unhighlight-hook s nil))))
+
+(defun dst-test--change-faces (section)
+  "Return the added/removed faces used in SECTION's body, in order."
+  (let ((pos (oref section content))
+        faces)
+    (while (< pos (oref section end))
+      (dolist (f (magit-difftastic--face-list
+                  (get-text-property pos 'font-lock-face)))
+        (when (and (symbolp f)
+                   (string-prefix-p "magit-difftastic-" (symbol-name f)))
+          (cl-pushnew f faces)))
+      (setq pos (or (next-single-property-change
+                     pos 'font-lock-face nil (oref section end))
+                    (oref section end))))
+    (nreverse faces)))
+
+(defconst dst-test--plain-faces
+  '(magit-difftastic-added magit-difftastic-removed))
+
+(defconst dst-test--highlight-faces
+  '(magit-difftastic-added-highlight magit-difftastic-removed-highlight))
+
+(ert-deftest magit-difftastic--ansi-color-apply/marks-changes ()
+  "difft's green and red text gets our faces and `magit-difftastic-change'."
+  (skip-unless (fboundp 'ansi-color--face-vec-face))
+  (let ((s (magit-difftastic--ansi-color-apply
+            "\e[2m1 \e[0m\e[92;1m09\e[0m\e[92m-\e[0m \e[91mx\e[0m")))
+    (should (equal s "1 09- x"))
+    ;; Dim line number: not a change.
+    (should-not (get-text-property 0 'magit-difftastic-change s))
+    ;; Bold added text keeps its bold.
+    (should (eq (get-text-property 2 'magit-difftastic-change s) 'added))
+    (let ((faces (magit-difftastic--face-list
+                  (get-text-property 2 'font-lock-face s))))
+      (should (memq 'magit-difftastic-added faces))
+      (should (memq 'ansi-color-bold faces))
+      (should-not (cl-find-if #'consp faces)))
+    (should (eq (get-text-property 4 'magit-difftastic-change s) 'added))
+    (should-not (get-text-property 5 'magit-difftastic-change s))
+    (should (eq (get-text-property 6 'magit-difftastic-change s) 'removed))
+    (should (memq 'magit-difftastic-removed
+                  (magit-difftastic--face-list
+                   (get-text-property 6 'font-lock-face s))))))
+
+(ert-deftest magit-difftastic-hunk-section/focus-highlights-changes ()
+  "A focused chunk shows highlight faces, and plain ones again once unfocused."
+  (skip-unless (fboundp 'ansi-color--face-vec-face))
+  (dst-test--with-chunks
+    (let ((a (car chunks)) (b (cadr chunks)))
+      (should (equal (dst-test--change-faces a) dst-test--plain-faces))
+      (dst-test--focus (list a))
+      (should (equal (dst-test--change-faces a) dst-test--highlight-faces))
+      (should (equal (dst-test--change-faces b) dst-test--plain-faces))
+      (dst-test--focus (list b))
+      (should (equal (dst-test--change-faces a) dst-test--plain-faces))
+      (should (equal (dst-test--change-faces b) dst-test--highlight-faces))
+      ;; Staying focused across an update keeps the highlight.
+      (dst-test--focus (list b))
+      (should (equal (dst-test--change-faces b) dst-test--highlight-faces))
+      (dst-test--focus nil)
+      (should (equal (dst-test--change-faces b) dst-test--plain-faces)))))
+
+(ert-deftest magit-difftastic--text-diff-p/first-header ()
+  "Only output whose first difft header names the `Text' language is a text diff."
+  (should (magit-difftastic--text-diff-p "a.txt --- Text\n1 x\n"))
+  (should (magit-difftastic--text-diff-p
+           "\na.scm --- 1/2 --- Text (1.9 MiB exceeded DFT_BYTE_LIMIT)\n1 x\n"))
+  (should-not (magit-difftastic--text-diff-p "a.el --- Emacs Lisp\n1 --- Text\n"))
+  (should-not (magit-difftastic--text-diff-p "a.el --- Emacs Lisp\n")))
+
+(defmacro dst-test--with-text-chunk (refine &rest body)
+  "Run BODY on a rendered, focusable text-diff chunk with REFINE as the setting.
+The chunk changes `bravo 2026-08-15' to `bravo 2026-09-03'; `chunk' is bound
+to its section for BODY."
+  (declare (indent 1))
+  `(dst-test--with-repo '(("a.txt" . "alpha\nbravo 2026-08-15\ncharlie\n"))
+       '(("a.txt" . "alpha\nbravo 2026-09-03\ncharlie\n"))
+     (with-temp-buffer
+       (magit-section-mode)
+       (let ((inhibit-read-only t)
+             (magit-difftastic-lazy nil)
+             (magit-difftastic-display "inline")
+             (magit-diff-refine-hunk ,refine)
+             (magit-diff-highlight-hunk-body t)
+             (magit-section-highlight-overlays nil)
+             (magit-section-selection-overlays nil)
+             (magit-section-highlighted-sections nil)
+             (magit-section-unhighlight-sections nil)
+             (magit-section-unhighlight-hook
+              (list #'magit-difftastic--unhighlight)))
+         (magit-insert-section (root)
+           (magit-difftastic--insert-file-sections
+            '("a.txt") (magit-difftastic--context-unstaged)))
+         (let ((chunk (car (oref (car (oref magit-root-section children))
+                                 children))))
+           (dst-test--with-highlight-advice ,@body))))))
+
+(defun dst-test--faces-on (section text)
+  "Return the faces on the first occurrence of TEXT in SECTION's body."
+  (save-excursion
+    (goto-char (oref section content))
+    (search-forward text (oref section end))
+    (magit-difftastic--face-list
+     (get-text-property (match-beginning 0) 'font-lock-face))))
+
+(ert-deftest magit-difftastic--refine-chunk/text-diff ()
+  "With refinement on, a text diff's changed words get the refine faces.
+The rest of each changed line and the bold line-number gutters keep the plain
+change faces, and focusing the chunk leaves the refined words alone."
+  (skip-unless (and dst-test--have-tools (fboundp 'ansi-color--face-vec-face)))
+  (dst-test--with-text-chunk t
+    (let ((refined (dst-test--faces-on chunk "08")))
+      (should (memq 'magit-difftastic-refine-removed refined))
+      (should-not (memq 'magit-difftastic-removed refined))
+      (should-not (memq 'ansi-color-bold refined)))
+    (should (memq 'magit-difftastic-refine-added (dst-test--faces-on chunk "03")))
+    (should (memq 'magit-difftastic-removed (dst-test--faces-on chunk "bravo")))
+    ;; The removed line's gutter, "2 ", is bold but not refined.
+    (let ((gutter (dst-test--faces-on chunk "2 ")))
+      (should (memq 'magit-difftastic-removed gutter))
+      (should (memq 'ansi-color-bold gutter)))
+    (dst-test--focus (list chunk))
+    (should (memq 'magit-difftastic-removed-highlight
+                  (dst-test--faces-on chunk "bravo")))
+    (should (memq 'magit-difftastic-refine-removed
+                  (dst-test--faces-on chunk "08")))))
+
+(ert-deftest magit-difftastic--refine-chunk/off ()
+  "With `magit-diff-refine-hunk' nil, changed words keep difft's bold colour."
+  (skip-unless (and dst-test--have-tools (fboundp 'ansi-color--face-vec-face)))
+  (dst-test--with-text-chunk nil
+    (let ((faces (dst-test--faces-on chunk "08")))
+      (should (memq 'magit-difftastic-removed faces))
+      (should (memq 'ansi-color-bold faces)))))
+
+(ert-deftest magit-difftastic-hunk-section/focus-respects-hunk-body-option ()
+  "With `magit-diff-highlight-hunk-body' nil, a focused chunk stays plain."
+  (skip-unless (fboundp 'ansi-color--face-vec-face))
+  (dst-test--with-chunks
+    (let ((magit-diff-highlight-hunk-body nil))
+      (dst-test--focus (list (car chunks)))
+      (should (equal (dst-test--change-faces (car chunks))
+                     dst-test--plain-faces)))))
+
 ;;;; Whitespace-ignoring diff flags (issue #5) -----------------------------
 
 (ert-deftest magit-difftastic--whitespace-args/extracts-flags ()
