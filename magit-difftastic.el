@@ -129,11 +129,11 @@
 ;;   - `difft' is run once per changed file when its content first needs
 ;;     rendering.  Files in a section are rendered concurrently (up to
 ;;     `magit-difftastic-render-jobs' processes at a time) and the result is
-;;     cached across refreshes keyed on the compared blobs (see
-;;     `magit-difftastic-cache'), so an unchanged file is not re-rendered -- a
-;;     refresh costs roughly the slowest file that actually changed.  A very
-;;     large set of first-time changes can still make `magit-status' sluggish,
-;;     since the refresh waits for that initial batch.
+;;     cached across refreshes (see `magit-difftastic-cache').  Lazy rendering
+;;     queues that work in the background and prioritizes expanded files.
+;;     Chunk insertion and syntax highlighting still run in Emacs, so expanding
+;;     a very large diff can take noticeable time.  With
+;;     `magit-difftastic-lazy' disabled, refresh waits for the entire batch.
 ;;   - Untracked files are still rendered by the stock
 ;;     `magit-insert-untracked-files'.
 ;;   - In `magit-diff-mode'/`magit-revision-mode' buffers the difftastic
@@ -155,6 +155,7 @@
 (require 'cl-lib)
 (require 'magit)
 (require 'difftastic)
+(require 'magit-difftastic-async)
 
 (defgroup magit-difftastic nil
   "Difftastic-rendered, stageable sections in `magit-status'."
@@ -195,7 +196,8 @@ revision buffer is padded so its right column begins at the same column as the
 widest chunk's, lining the divider and the right-hand line numbers up across
 the whole buffer.  The padding is inserted only in the gap between the two
 columns, so the rendered code -- and per-chunk/region staging -- are
-unaffected.
+unaffected.  With `magit-difftastic-lazy' enabled, alignment is within each
+file instead of across files, so later completions do not shift existing chunks.
 
 Has no effect with the `inline' display (which has no right column) or on
 chunks difft collapses to a single column.  Set to nil to keep difftastic's
@@ -248,11 +250,26 @@ At least `magit-difftastic-min-width' columns are always used.  The
   :type 'integer
   :group 'magit-difftastic)
 
+(defcustom magit-difftastic-lazy t
+  "Whether to render difftastic asynchronously and populate files on expansion.
+When non-nil, collapsed files initially contain only headings.  Uncached
+files render in the background after a short idle delay; expanding a file
+prioritizes its existing job and displays its chunks when ready.  Collapsed
+files are not syntax-highlighted.  Set to nil for synchronous eager rendering.
+Changes take effect on the next refresh."
+  :type 'boolean
+  :group 'magit-difftastic
+  :initialize #'custom-initialize-default
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         (magit-difftastic--async-cancel-all)))
+
 (defcustom magit-difftastic-render-jobs nil
-  "Maximum number of `difft' processes to run concurrently while rendering.
-On every refresh each changed file is rendered by its own `difft' subprocess;
-running them concurrently makes the rendering wall-clock time roughly the
-slowest single file rather than the sum of all of them.
+  "Maximum number of concurrent rendering and validation jobs.
+Each uncached file is rendered by its own `difft' subprocess.  Lazy rendering
+reserves one slot for expanded files when the limit exceeds one; other jobs
+start after an idle delay.  Eager rendering uses all slots and waits for the
+batch before inserting its sections.
 
   - nil (default): use the number of available processors (when Emacs can
     report it), capped at a sensible maximum, else a small fixed number.
@@ -454,32 +471,36 @@ A rename/copy entry is keyed on the NEW path (matching how files are rendered).
 This is the single plumbing pass both the render/syntax caches (via the blob
 ids) and the file headings (via the status word) read from, so a refresh runs it
 once instead of a separate `--raw' and `--name-status' call."
+  (with-temp-buffer
+    (apply #'process-file "git" nil t nil
+           (append (magit-difftastic--raw-args diff-args)
+                   (when files (cons "--" files))))
+    (magit-difftastic--parse-raw-info (buffer-string))))
+
+(defun magit-difftastic--parse-raw-info (raw)
+  "Return a path-to-metadata hash for Git's RAW diff output."
   (let ((map (make-hash-table :test 'equal)))
-    (with-temp-buffer
-      (apply #'process-file "git" nil t nil
-             (append (magit-difftastic--raw-args diff-args)
-                     (when files (cons "--" files))))
-      (dolist (line (split-string (buffer-string) "\n" t))
-        ;; A raw line is ":OMODE NMODE OID NID STATUS\tPATH" (rename/copy:
-        ;; "...\tOLD\tNEW").  Combined (merge) diffs start with "::" and are
-        ;; not rendered by us, so they are ignored here.
-        (when (and (string-prefix-p ":" line)
-                   (not (string-prefix-p "::" line)))
-          (when-let* ((tab (string-search "\t" line))
-                      (meta (split-string (substring line 0 tab) " " t))
-                      (paths (split-string (substring line (1+ tab)) "\t"))
-                      (oid (nth 2 meta))
-                      (nid (nth 3 meta))
-                      (status (nth 4 meta))
-                      (path (car (last paths))))
-            (let ((code (aref status 0)))
-              (puthash path
-                       (list :old oid :new nid
-                             :status (magit-difftastic--status-word code)
-                             ;; The OLD path of a rename/copy (raw lists it as
-                             ;; the first of the two tab-separated paths).
-                             :orig (and (memq code '(?C ?R)) (car paths)))
-                       map))))))
+    (dolist (line (split-string raw "\n" t))
+      ;; A raw line is ":OMODE NMODE OID NID STATUS\tPATH" (rename/copy:
+      ;; "...\tOLD\tNEW").  Combined (merge) diffs start with "::" and are
+      ;; not rendered by us, so they are ignored here.
+      (when (and (string-prefix-p ":" line)
+                 (not (string-prefix-p "::" line)))
+        (when-let* ((tab (string-search "\t" line))
+                    (meta (split-string (substring line 0 tab) " " t))
+                    (paths (split-string (substring line (1+ tab)) "\t"))
+                    (oid (nth 2 meta))
+                    (nid (nth 3 meta))
+                    (status (nth 4 meta))
+                    (path (car (last paths))))
+          (let ((code (aref status 0)))
+            (puthash path
+                     (list :old oid :new nid
+                           :status (magit-difftastic--status-word code)
+                           ;; The OLD path of a rename/copy (raw lists it as
+                           ;; the first of the two tab-separated paths).
+                           :orig (and (memq code '(?C ?R)) (car paths)))
+                     map)))))
     map))
 
 (defun magit-difftastic--blob-ids (diff-args files)
@@ -1581,9 +1602,15 @@ worktree to apply a patch to."
 ;; `magit-stage', if point is on a difftastic chunk we handle it, otherwise we
 ;; call the original command unchanged.
 
+(defun magit-difftastic--ensure-rendered-at-point ()
+  "Reject chunk actions on a pending or failed diff body."
+  (when (get-text-property (point) 'magit-difftastic-pending)
+    (user-error "Diff is not ready; use the file heading for whole-file actions")))
+
 (defun magit-difftastic--stage-advice (orig &rest args)
   "Around-advice for `magit-stage'.
 Stage the chunk at point, else call ORIG with ARGS (see commentary)."
+  (magit-difftastic--ensure-rendered-at-point)
   (if-let* ((section (magit-difftastic--current-chunk)))
       (magit-difftastic--stage-chunk-1 section)
     (apply orig args)))
@@ -1591,6 +1618,7 @@ Stage the chunk at point, else call ORIG with ARGS (see commentary)."
 (defun magit-difftastic--unstage-advice (orig &rest args)
   "Around-advice for `magit-unstage'.
 Unstage the chunk at point, else call ORIG with ARGS (see commentary)."
+  (magit-difftastic--ensure-rendered-at-point)
   (if-let* ((section (magit-difftastic--current-chunk)))
       (magit-difftastic--unstage-chunk-1 section)
     (apply orig args)))
@@ -1598,6 +1626,7 @@ Unstage the chunk at point, else call ORIG with ARGS (see commentary)."
 (defun magit-difftastic--discard-advice (orig &rest args)
   "Around-advice for `magit-discard'/`magit-delete-thing'.
 Discard the chunk at point, else call ORIG with ARGS (see commentary)."
+  (magit-difftastic--ensure-rendered-at-point)
   (if-let* ((section (magit-difftastic--current-chunk)))
       (magit-difftastic--discard-chunk-1 section)
     (apply orig args)))
@@ -1820,8 +1849,11 @@ section displays even when difft's text display merges several JSON chunks."
            ;; Match Magit's hunk highlighting: when point is on the chunk, its
            ;; heading gets `magit-diff-hunk-heading-highlight' (and the selection
            ;; face for multi-chunk regions), exactly like a `magit-hunk-section'.
-           :heading-highlight-face 'magit-diff-hunk-heading-highlight
-           :heading-selection-face 'magit-diff-hunk-heading-selection)
+           :heading-highlight-face 'magit-diff-hunk-heading-highlight)
+        (when (slot-exists-p section 'heading-selection-face)
+          ;; Avoid compile-time slot validation against older Magit classes.
+          (funcall (symbol-function 'eieio-oset)
+                   section 'heading-selection-face 'magit-diff-hunk-heading-selection))
         ;; Set the section keymap here rather than via `magit-insert-section':
         ;; the base `magit-section' `keymap' slot has no initarg, so passing
         ;; `:keymap' would signal `invalid-slot-name'.  It is applied later in
@@ -1990,6 +2022,314 @@ staging and visibility apply unchanged.  Falls back to difftastic rendering if
      file context
      (magit-difftastic--file-statuses (plist-get context :diff-args)))))
 
+(cl-defstruct (magit-difftastic--lazy-file
+               (:constructor magit-difftastic--lazy-file-create))
+  file context section root buffer directory ids signature key display width
+  job output callback validation-callback watch-files stamp env (state 'pending))
+
+(defvar-local magit-difftastic--lazy-sections nil)
+(defvar-local magit-difftastic--lazy-root nil)
+(defvar-local magit-difftastic--lazy-requests nil)
+(defvar magit-difftastic--lazy-watched-files nil)
+(defvar magit-difftastic--lazy-stamp nil)
+(defvar magit-difftastic--lazy-environment nil)
+
+(defun magit-difftastic--lazy-stat (file)
+  "Return FILE's size, modification and status-change times, or nil."
+  (when-let* ((attrs (file-attributes file)))
+    (list (file-attribute-size attrs)
+          (file-attribute-modification-time attrs)
+          (file-attribute-status-change-time attrs))))
+
+(defun magit-difftastic--lazy-watch-files (gitdir)
+  "Return index and current-reference paths to watch in GITDIR."
+  (when gitdir
+    (let* ((head (expand-file-name "HEAD" gitdir))
+           (common-file (expand-file-name "commondir" gitdir))
+           (common (if (file-exists-p common-file)
+                       (expand-file-name
+                        (with-temp-buffer
+                          (insert-file-contents common-file)
+                          (string-trim (buffer-string))) gitdir)
+                     gitdir))
+           (ref (with-temp-buffer
+                  (insert-file-contents head)
+                  (when (looking-at "ref: \\(.*\\)")
+                    (match-string 1)))))
+      (delq nil (list (expand-file-name "index" gitdir) head
+                      (expand-file-name "packed-refs" common)
+                      (and ref (expand-file-name ref common)))))))
+
+(defun magit-difftastic--lazy-prune ()
+  "Unsubscribe lazy requests superseded by the current section tree."
+  (setq magit-difftastic--lazy-requests
+        (cl-delete-if
+         (lambda (request)
+           (unless (magit-difftastic--lazy-live-p request)
+             (dolist (callback (list (magit-difftastic--lazy-file-callback request)
+                                    (magit-difftastic--lazy-file-validation-callback request)))
+               (magit-difftastic--async-unsubscribe (current-buffer) callback))
+             t))
+         magit-difftastic--lazy-requests)))
+
+(defun magit-difftastic--refresh-advice (orig &rest args)
+  "Run ORIG with ARGS while deferring async work, then prune old requests."
+  (let ((magit-difftastic--refreshing t))
+    (prog1 (apply orig args)
+      (magit-difftastic--lazy-prune))))
+
+(defun magit-difftastic--lazy-signature (file info)
+  "Return the content and rename identity of FILE described by INFO."
+  (and info
+       (list info (and (magit-difftastic--all-zero-id-p (plist-get info :new))
+                       (magit-difftastic--lazy-stat
+                        (expand-file-name file default-directory))))))
+
+(defun magit-difftastic--lazy-live-p (request)
+  "Return non-nil if REQUEST still belongs to the current rendered tree."
+  (and (buffer-live-p (magit-difftastic--lazy-file-buffer request))
+       (with-current-buffer (magit-difftastic--lazy-file-buffer request)
+         (and magit-difftastic-lazy
+              (eq magit-root-section (magit-difftastic--lazy-file-root request))
+              (magit-difftastic--render-with-difftastic-p
+               (magit-difftastic--lazy-file-file request))
+              (equal magit-difftastic-display
+                     (magit-difftastic--lazy-file-display request))))))
+
+(defun magit-difftastic--lazy-fresh-p (request)
+  "Return non-nil if REQUEST still describes the current diff."
+  (let ((signature (magit-difftastic--lazy-file-signature request)))
+    (and signature
+         (equal signature
+                (magit-difftastic--lazy-signature
+                 (magit-difftastic--lazy-file-file request) (car signature)))
+         (equal (magit-difftastic--lazy-file-stamp request)
+                (mapcar #'magit-difftastic--lazy-stat
+                        (magit-difftastic--lazy-file-watch-files request))))))
+
+(defun magit-difftastic--lazy-visible-p (section)
+  "Return non-nil when SECTION and its ancestors are expanded."
+  (not (cl-some (lambda (s) (oref s hidden))
+               (magit-section-lineage section t))))
+
+(defun magit-difftastic--lazy-insert-body (request)
+  "Insert REQUEST's available chunks or a pending or failure message."
+  (when (and (eq (magit-difftastic--lazy-file-state request) 'ready)
+             (not (magit-difftastic--lazy-fresh-p request)))
+    (setf (magit-difftastic--lazy-file-state request) 'stale))
+  (pcase (magit-difftastic--lazy-file-state request)
+    ('ready
+     (let* ((file (magit-difftastic--lazy-file-file request))
+            (magit-difftastic-display (magit-difftastic--lazy-file-display request))
+            (magit-difftastic-width (magit-difftastic--lazy-file-width request))
+            (magit-difftastic--file-ids (magit-difftastic--lazy-file-ids request))
+            (magit-difftastic--render-cache (make-hash-table :test #'equal)))
+       (puthash file (magit-difftastic--lazy-file-output request)
+                magit-difftastic--render-cache)
+       (let ((magit-difftastic--align-col
+              (and magit-difftastic-align-columns
+                   (magit-difftastic--two-column-display-p)
+                   (magit-difftastic--compute-align-col (list file)))))
+         (condition-case err
+             (progn
+               (atomic-change-group
+                 (magit-difftastic--insert-chunks
+                  (magit-difftastic--lazy-file-output request) file
+                  (magit-difftastic--lazy-file-context request)))
+               (setf (magit-difftastic--lazy-file-state request) 'rendered))
+           (error
+            (oset (magit-difftastic--lazy-file-section request) children nil)
+            (setf (magit-difftastic--lazy-file-state request) 'failed)
+            (message "Difftastic insertion failed: %s" (error-message-string err))
+            (magit-difftastic--lazy-insert-body request))))))
+    (_
+     (insert
+      (propertize
+       (pcase (magit-difftastic--lazy-file-state request)
+         ('failed "Difftastic failed; refresh to retry or toggle to stock rendering.\n")
+         ('stale "Diff changed; refresh to render the current contents.\n")
+         (_ "Rendering difftastic…\n"))
+       'face 'shadow 'magit-difftastic-pending t)))))
+
+(defun magit-difftastic--lazy-section-properties (section)
+  "Set SECTION's text ownership without overwriting its children."
+  (if (fboundp 'magit-section--set-section-properties)
+      (magit-section--set-section-properties section)
+    ;; Magit 4.0 keeps this bookkeeping inside its section-finishing function.
+    (let* ((start (oref section start))
+           (end (oref section end))
+           (map (oref section keymap))
+           (map (if (symbolp map) (and map (symbol-value map)) map))
+           (props (append (list 'magit-section section)
+                          (and map (list 'keymap map)))))
+      (if (not (oref section children))
+          (add-text-properties start end props)
+        (while (< start end)
+          (let ((next (next-single-property-change start 'magit-section nil end)))
+            (unless (get-text-property start 'magit-section)
+              (add-text-properties start next props))
+            (setq start next)))))))
+
+(defun magit-difftastic--lazy-publish (request)
+  "Replace REQUEST's visible placeholder with its completed body."
+  (when (and (magit-difftastic--lazy-live-p request)
+             (memq (magit-difftastic--lazy-file-state request) '(ready failed stale)))
+    (with-current-buffer (magit-difftastic--lazy-file-buffer request)
+      (let ((section (magit-difftastic--lazy-file-section request)))
+        (when (and (not (oref section washer))
+                   (magit-difftastic--lazy-visible-p section)
+                   (markerp (oref section end)))
+          (let* ((inhibit-read-only t)
+                 (magit-inhibit-refresh t)
+                 (default-directory (magit-difftastic--lazy-file-directory request))
+                 (magit-insert-section--current section)
+                 (magit-insert-section--parent section)
+                 (ends (mapcar (lambda (s)
+                                 (let ((marker (oref s end)))
+                                   (cons marker (marker-insertion-type marker))))
+                               (magit-section-lineage section t)))
+                 (modified (buffer-modified-p)))
+            (save-restriction
+              (widen)
+              (save-excursion
+                (unwind-protect
+                    (progn
+                      ;; The last file can share its end with several ancestors.
+                      (dolist (entry ends) (set-marker-insertion-type (car entry) t))
+                      (goto-char (oref section content))
+                      (delete-region (point) (oref section end))
+                      (magit-difftastic--lazy-insert-body request)
+                      (magit-difftastic--lazy-section-properties section)
+                      (magit-section-maybe-add-heading-map section)
+                      (magit-section-maybe-remove-heading-map section)
+                      (dolist (child (oref section children))
+                        (if (oref child hidden)
+                            (magit-section-hide child)
+                          (magit-section-show child))))
+                  (dolist (entry ends)
+                    (set-marker-insertion-type (car entry) (cdr entry)))
+                  (set-buffer-modified-p modified))))
+            (setq magit-section-highlight-force-update t)))))))
+
+(defun magit-difftastic--lazy-rendered (request raw error)
+  "Validate REQUEST's rendered RAW asynchronously, or report ERROR."
+  (when (magit-difftastic--lazy-live-p request)
+    (if error
+        (magit-difftastic--lazy-complete request raw error)
+      (let* ((file (magit-difftastic--lazy-file-file request))
+             (context (magit-difftastic--lazy-file-context request))
+             (signature (magit-difftastic--lazy-file-signature request))
+             (original (plist-get (car signature) :orig))
+             (callback
+              (lambda (metadata failure)
+                (if (and (not failure)
+                         (equal (car signature)
+                                (gethash file (magit-difftastic--parse-raw-info metadata))))
+                    (magit-difftastic--lazy-complete request raw nil)
+                  (when (magit-difftastic--lazy-live-p request)
+                    (setf (magit-difftastic--lazy-file-state request)
+                          (if failure 'failed 'stale))
+                    (magit-difftastic--lazy-publish request))))))
+        (setf (magit-difftastic--lazy-file-validation-callback request) callback
+              (magit-difftastic--lazy-file-job request)
+              (magit-difftastic--async-request
+               (list 'validate (or (magit-difftastic--lazy-file-key request) request))
+               (magit-difftastic--lazy-file-directory request)
+               (append (magit-difftastic--raw-args (plist-get context :diff-args))
+                       (list "--" file) (and original (list original)))
+               (magit-difftastic--lazy-file-env request)
+               (magit-difftastic--lazy-file-buffer request) callback
+               (magit-difftastic--lazy-visible-p
+                (magit-difftastic--lazy-file-section request))))))))
+
+(defun magit-difftastic--lazy-complete (request raw error)
+  "Record RAW or ERROR for REQUEST and populate its visible section."
+  (when (magit-difftastic--lazy-live-p request)
+    (with-current-buffer (magit-difftastic--lazy-file-buffer request)
+      (let ((default-directory (magit-difftastic--lazy-file-directory request)))
+        (cond
+         (error (setf (magit-difftastic--lazy-file-state request) 'failed))
+         ((not (magit-difftastic--lazy-fresh-p request))
+          (setf (magit-difftastic--lazy-file-state request) 'stale))
+         (t
+          (let ((output (difftastic--ansi-color-apply raw)))
+            (setf (magit-difftastic--lazy-file-output request) output
+                  (magit-difftastic--lazy-file-state request) 'ready)
+            (magit-difftastic--cache-put
+             (magit-difftastic--lazy-file-key request) output))))
+        (magit-difftastic--lazy-publish request)))))
+
+(defun magit-difftastic--lazy-show (section)
+  "Populate completed lazy files after SECTION becomes visible."
+  (when (and magit-difftastic-lazy magit-difftastic--lazy-sections)
+    (when-let* ((request (gethash section magit-difftastic--lazy-sections)))
+      (when (magit-difftastic--lazy-visible-p section)
+        (when-let* ((job (magit-difftastic--lazy-file-job request)))
+          (magit-difftastic--async-promote job))
+        (magit-difftastic--lazy-publish request)))))
+
+(defun magit-difftastic--lazy-expand (request)
+  "Insert REQUEST's initial body and prioritize any pending render."
+  (magit-difftastic--lazy-insert-body request)
+  (when (magit-difftastic--lazy-visible-p (magit-difftastic--lazy-file-section request))
+    (when-let* ((job (magit-difftastic--lazy-file-job request)))
+      (magit-difftastic--async-promote job))))
+
+(defun magit-difftastic--insert-lazy-file (file context statuses info)
+  "Insert FILE's deferred section using CONTEXT, STATUSES and raw INFO."
+  (unless (eq magit-root-section magit-difftastic--lazy-root)
+    (setq magit-difftastic--lazy-root magit-root-section
+          magit-difftastic--lazy-sections (make-hash-table :test #'eq)))
+  (let* ((status (cdr (assoc file statuses)))
+         (width (magit-difftastic--width))
+         (directory default-directory)
+         (identity (and info (gethash file info)))
+         (signature (magit-difftastic--lazy-signature file identity))
+         ;; Include invocation and environment, not just the displayed filename.
+         (env (or magit-difftastic--lazy-environment
+                  (difftastic--build-git-process-environment
+                   width (list "--display" magit-difftastic-display))))
+         (key (and signature
+                   (list 'lazy directory file signature
+                         (plist-get context :diff-args)
+                         magit-difftastic-display width env)))
+         (output (magit-difftastic--cache-get key))
+         (watch-files magit-difftastic--lazy-watched-files)
+         (request (magit-difftastic--lazy-file-create
+                   :file file :context context :root magit-root-section
+                   :buffer (current-buffer) :directory directory
+                   :ids magit-difftastic--file-ids :signature signature :key key
+                   :display magit-difftastic-display :width width :output output
+                   :watch-files watch-files :env env
+                   :stamp magit-difftastic--lazy-stamp
+                   :state (if output 'ready 'pending))))
+    (magit-insert-section section
+        (file file (or (equal (car status) "deleted")
+                      (derived-mode-p 'magit-status-mode)))
+      (setf (magit-difftastic--lazy-file-section request) section)
+      (puthash section request magit-difftastic--lazy-sections)
+      (magit-insert-heading
+        (magit-difftastic--file-heading file (or (car status) "modified") (cdr status)))
+      (push request magit-difftastic--lazy-requests)
+      (unless output
+        (let ((callback (lambda (raw error)
+                          (magit-difftastic--lazy-rendered request raw error))))
+          (setf (magit-difftastic--lazy-file-callback request) callback
+                (magit-difftastic--lazy-file-job request)
+                (magit-difftastic--async-request
+                 (or key (list 'unkeyed request)) directory
+                 (append (plist-get context :diff-args) (list "--" file)
+                         (and (cdr status) (list (cdr status))))
+                 env (current-buffer) callback
+                 (magit-difftastic--lazy-visible-p section)))))
+      (let ((hidden (oref section hidden)))
+        (unwind-protect
+            (progn
+              (oset section hidden (not (magit-difftastic--lazy-visible-p section)))
+              (magit-insert-section-body
+                (magit-difftastic--lazy-expand request)))
+          (oset section hidden hidden))))))
+
 (defun magit-difftastic--insert-difftastic-file (file context statuses)
   "Insert the difftastic `file' section for FILE using CONTEXT.
 STATUSES is the (PATH . (STATUS . ORIG)) alist for this diff (see
@@ -2108,7 +2448,16 @@ like it expands straight to its diff in Magit."
                               info)
                      m)))
          (magit-difftastic--file-ids ids)
+         (magit-difftastic--lazy-watched-files
+          (and magit-difftastic-lazy
+               (magit-difftastic--lazy-watch-files (magit-gitdir))))
+         (magit-difftastic--lazy-stamp
+          (mapcar #'magit-difftastic--lazy-stat magit-difftastic--lazy-watched-files))
          (width (magit-difftastic--width))
+         (magit-difftastic--lazy-environment
+          (and magit-difftastic-lazy
+               (difftastic--build-git-process-environment
+                width (list "--display" magit-difftastic-display))))
          ;; Pre-warm: resolve every difftastic-rendered file in this group up
          ;; front (stock-rendered files and rename sources are skipped -- the
          ;; former go through `magit--insert-diff', the latter are not shown).
@@ -2125,7 +2474,7 @@ like it expands straight to its diff in Magit."
                     (or (not (magit-difftastic--render-with-difftastic-p f))
                         (member f rename-origins)))
                   files)))
-            (when render-files
+            (when (and render-files (not magit-difftastic-lazy))
               (magit-difftastic--prewarm render-files context width ids))))
          ;; With a side-by-side layout, align every chunk's right column to the
          ;; widest chunk's across the whole group (see the "Cross-chunk column
@@ -2139,7 +2488,9 @@ like it expands straight to its diff in Magit."
         ;; The XOR of the default renderer and this buffer's per-file override
         ;; decides each file (see `magit-difftastic--render-with-difftastic-p').
         (if (magit-difftastic--render-with-difftastic-p file)
-            (magit-difftastic--insert-difftastic-file file context statuses)
+            (if magit-difftastic-lazy
+                (magit-difftastic--insert-lazy-file file context statuses info)
+              (magit-difftastic--insert-difftastic-file file context statuses))
           (let ((status (cdr (assoc file statuses))))
             (magit-difftastic--insert-stock-file
              file context (and (equal (car status) "renamed")
@@ -2613,6 +2964,8 @@ whole buffer."
   :group 'magit-difftastic
   (if magit-difftastic-mode
       (progn
+        (advice-add 'magit-section-show :after #'magit-difftastic--lazy-show)
+        (advice-add 'magit-refresh-buffer :around #'magit-difftastic--refresh-advice)
         (advice-add 'magit-insert-unstaged-changes :around
                     #'magit-difftastic--insert-unstaged-advice)
         (advice-add 'magit-insert-staged-changes :around
@@ -2627,6 +2980,9 @@ whole buffer."
             (advice-add cmd :around advice)))
         (magit-difftastic--set-evil-keys t)
         (magit-difftastic--set-toggle-key t))
+    (magit-difftastic--async-cancel-all)
+    (advice-remove 'magit-section-show #'magit-difftastic--lazy-show)
+    (advice-remove 'magit-refresh-buffer #'magit-difftastic--refresh-advice)
     (advice-remove 'magit-insert-unstaged-changes
                    #'magit-difftastic--insert-unstaged-advice)
     (advice-remove 'magit-insert-staged-changes
