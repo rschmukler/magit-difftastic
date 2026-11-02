@@ -700,8 +700,113 @@ code keyed off); the patch must still target the SECOND change."
 
 ;;;; Integration: line-number hiding ---------------------------------------
 
+(defun dst-test--visible-line (pos)
+  "Return the text of the line at POS as displayed.
+Empty `display' strings are omitted and `(space :align-to COL)' stretches are
+rendered as spaces up to COL."
+  (save-excursion
+    (goto-char pos)
+    (let ((eol (line-end-position))
+          (out ""))
+      (goto-char (line-beginning-position))
+      (while (< (point) eol)
+        (let ((next (or (next-single-property-change (point) 'display nil eol) eol))
+              (disp (get-text-property (point) 'display)))
+          (pcase disp
+            ("" nil)
+            (`(space :align-to ,col)
+             (setq out (concat out (make-string
+                                    (max 0 (- col (string-width out))) ?\s))))
+            (_ (setq out (concat out (buffer-substring-no-properties
+                                      (point) next)))))
+          (goto-char next)))
+      out)))
+
+(ert-deftest magit-difftastic-integration/hide-line-numbers-aligns-chunks ()
+  "With gutters hidden, aligned chunks keep their right columns in line.
+difft pads line numbers to a width set per file, so the chunks below have
+differently sized gutters on both sides."
+  (skip-unless dst-test--have-tools)
+  (skip-unless (fboundp 'difftastic--classify-chunk))
+  (let* ((lines (lambda (n) (mapconcat (lambda (i) (format "l%d\n" i))
+                                       (number-sequence 1 n) "")))
+         (big-old (funcall lines 120))
+         (big-new (replace-regexp-in-string
+                   "^l61$" "CH61" (replace-regexp-in-string "^l2$" "CH2" big-old))))
+    (dst-test--with-repo `(("small.txt" . "a\nb\nc\n")
+                           ("big.txt" . ,big-old))
+        `(("small.txt" . "a\nCHB\nc\n")
+          ("big.txt" . ,big-new))
+      (dolist (display '("side-by-side" "side-by-side-show-both"))
+        (ert-info ((format "display %s" display))
+          (let* ((magit-difftastic-display display)
+                 (magit-difftastic-width 160)
+                 (bodies (mapcan (lambda (file)
+                                   (magit-difftastic--split-chunk-bodies
+                                    (magit-difftastic--file-diff-string
+                                     file magit-difftastic--diff-base)))
+                                 '("small.txt" "big.txt")))
+                 (target (apply #'max (mapcar #'magit-difftastic--chunk-right-col
+                                              bodies)))
+                 (right-cols nil))
+            ;; One chunk from small.txt and two from big.txt.
+            (should (= (length bodies) 3))
+            (dolist (body bodies)
+              (with-temp-buffer
+                (insert "@@ @@\n")
+                (dolist (l (magit-difftastic--align-chunk-lines body target))
+                  (insert l "\n"))
+                (magit-difftastic--hide-line-numbers (point-min) (point-max))
+                (goto-char (point-min))
+                (forward-line 1)
+                (while (not (eobp))
+                  (let ((row (dst-test--visible-line (point))))
+                    (unless (string-blank-p row)
+                      ;; Both sides have a single token per row: the left code
+                      ;; starts the row and the right code is the last token.
+                      (should (string-match-p "\\`[a-zA-Z]" row))
+                      (should (string-match "[^ ]+\\'" row))
+                      (push (match-beginning 0) right-cols)))
+                  (forward-line 1))))
+            (should right-cols)
+            (should (= 1 (length (delete-dups right-cols))))))))))
+
+(ert-deftest magit-difftastic-integration/hide-line-numbers-collapses-gutter ()
+  "Hidden gutters take no columns in every display, leaving the code aligned."
+  (skip-unless dst-test--have-tools)
+  (skip-unless (fboundp 'difftastic--classify-chunk))
+  (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
+      `(("sample.txt" . ,dst-test--new))
+    (dolist (display dst-test--displays)
+      (ert-info ((format "display %s" display))
+        (let ((magit-difftastic-display display))
+          (with-temp-buffer
+            (insert (dst-test--chunk-buffer-string "sample.txt" display))
+            (magit-difftastic--hide-line-numbers (point-min) (point-max))
+            (goto-char (point-min))
+            (forward-line 1)
+            (let (rows)
+              (while (not (eobp))
+                (push (dst-test--visible-line (point)) rows)
+                (forward-line 1))
+              (setq rows (nreverse rows))
+              (dolist (row rows)
+                ;; The fixture has no digits, so any left over are gutter.
+                (should-not (string-match-p "[0-9.]" row)))
+              (if (equal display "inline")
+                  ;; No gutter padding remains before the code.
+                  (dolist (row rows)
+                    (should-not (string-prefix-p " " row)))
+                ;; The left column starts each row and the right column stays
+                ;; aligned, including on rows that only have a right side.
+                (should (string-prefix-p "alpha " (car rows)))
+                (let ((col (lambda (re)
+                             (cl-some (lambda (row) (string-match re row)) rows))))
+                  (should (equal (funcall col "BRAVO-changed")
+                                 (funcall col "golf-added"))))))))))))
+
 (ert-deftest magit-difftastic-integration/hide-line-numbers ()
-  "Hiding blanks the gutter via a `display' property but keeps text and staging."
+  "Hiding collapses the gutter via a `display' property but keeps text and staging."
   (skip-unless dst-test--have-tools)
   (skip-unless (fboundp 'difftastic--classify-chunk))
   (dst-test--with-repo `(("sample.txt" . ,dst-test--old))
@@ -710,15 +815,13 @@ code keyed off); the patch must still target the SECOND change."
      (with-temp-buffer
       (insert (dst-test--chunk-buffer-string "sample.txt" "side-by-side-show-both"))
       (magit-difftastic--hide-line-numbers (point-min) (point-max))
-      ;; The first body row's leading digit is visually blanked, text intact.
+      ;; The first body row's leading digit is collapsed, text intact.
       (goto-char (point-min))
       (forward-line 1)
-      (let* ((p (point))
-             (disp (get-text-property p 'display)))
-        (should (stringp disp))
-        (should (string-blank-p disp))
+      (let ((p (point)))
+        (should (equal (get-text-property p 'display) ""))
         (should (string-match-p "[0-9]"
-                                (buffer-substring-no-properties p (1+ p)))))
+                                (buffer-substring-no-properties p (+ p 2)))))
       ;; Staging still resolves with numbers hidden.
       (let ((sec (dst-test--make-section
                   (point-min)

@@ -1012,19 +1012,70 @@ See `magit-difftastic--parse-chunk-bounds'."
   (magit-difftastic--parse-chunk-bounds (oref section start) (oref section end)))
 
 (defun magit-difftastic--hide-line-numbers (beg end)
-  "Visually blank difft's line-number gutters in the chunk between BEG and END.
-The underlying buffer text is left intact, so staging is unaffected.  No-op
-when difftastic's parser is unavailable."
-  ;; Cover each line-number span with an equal-width run of spaces via a
-  ;; `display' property, so columns stay aligned while the numbers disappear.
-  (dolist (line (magit-difftastic--parse-chunk-bounds beg end))
-    (pcase-let ((`(,_ ,left ,right) line))
-      (dolist (cell (list left right))
-        (pcase cell
-          (`(,_ ,nbeg ,nend)
-           (when (and (integerp nbeg) (integerp nend) (< nbeg nend))
-             (put-text-property nbeg nend 'display
-                                (make-string (- nend nbeg) ?\s)))))))))
+  "Hide difft's line-number gutters in the chunk between BEG and END.
+The gutters, including their padding, take up no space on screen.  The
+underlying buffer text is left intact, so staging is unaffected.  No-op when
+difftastic's parser is unavailable."
+  ;; Each gutter is covered by an empty `display' string, so it neither
+  ;; occupies a column nor shows difft's or Magit's highlighting.
+  (when-let* ((lines (magit-difftastic--parse-chunk-bounds beg end)))
+    (cl-flet ((hide (from to)
+                (when (< from to)
+                  (put-text-property from to 'display ""))))
+      (pcase (magit-difftastic--chunk-layout beg end)
+        ('side-by-side
+         ;; The left numbers are right-aligned in a fixed-width column at the
+         ;; start of each row, so every row loses the same columns.  The right
+         ;; numbers' width varies between files and chunks, so instead the
+         ;; padding before them becomes a stretch to the column where the
+         ;; chunk's right gutter begins.  That column is shared by every chunk
+         ;; when `magit-difftastic-align-columns' is on, keeping the right
+         ;; column's code aligned across chunks and files.
+         (let ((left-width 0) right-col)
+           (pcase-dolist (`((,bol ,_) ,left ,right) lines)
+             (pcase left
+               (`(,_ ,_ ,nend) (setq left-width (max left-width (- nend bol)))))
+             (pcase right
+               (`(,_ ,nbeg ,_)
+                (setq right-col
+                      (max (or right-col 0)
+                           (string-width
+                            (buffer-substring-no-properties bol nbeg)))))))
+           (pcase-dolist (`((,bol ,eol) ,_ ,right) lines)
+             (let ((lend (min eol (+ bol left-width 1))))
+               (when (string-match-p "\\`[ .0-9]*\\'"
+                                     (buffer-substring-no-properties bol lend))
+                 (hide bol lend))
+               (pcase right
+                 (`(,_ ,nbeg ,nend)
+                  (let ((pad-beg (save-excursion
+                                   (goto-char nbeg)
+                                   (skip-chars-backward " " lend)
+                                   (point))))
+                    (when (< pad-beg nbeg)
+                      (put-text-property pad-beg nbeg 'display
+                                         `(space :align-to ,right-col)))
+                    (hide nbeg (min eol (1+ nend))))))))))
+        ('single-column
+         ;; Both columns precede the code.  A missing number is rendered as a
+         ;; run of spaces, whose width is read off a row that has only the
+         ;; second number.
+         (let ((blank-width
+                (or (cl-some (pcase-lambda (`((,bol ,_) ,left ,right))
+                               (and (null left) right (- (cadr right) bol)))
+                             lines)
+                    3)))
+           (pcase-dolist (`((,bol ,eol) ,left ,right) lines)
+             (let ((gend
+                    (pcase (list left right)
+                      (`(,_ (,_ ,_ ,nend)) (1+ nend))
+                      (`((,_ ,_ ,nend) nil)
+                       (save-excursion
+                         (goto-char (min eol (1+ nend)))
+                         (skip-chars-forward " " (min eol (+ (point) blank-width)))
+                         (point))))))
+               (when gend
+                 (hide bol (min eol gend)))))))))))
 
 ;;; Syntax highlighting
 ;;

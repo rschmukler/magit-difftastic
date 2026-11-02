@@ -370,10 +370,8 @@ Non-nil PARENT-HIDDEN initially collapses the file's parent."
               (should (eq (oref chunk parent) section))
               (goto-char (oref chunk content))
               (unless magit-difftastic-line-numbers
-                (let ((gutter (get-text-property (point) 'display)))
-                  (should (stringp gutter))
-                  (should (string-blank-p gutter))
-                  (should (looking-at-p "[0-9]"))))
+                (should (equal (get-text-property (point) 'display) ""))
+                (should (looking-at-p " *[0-9]")))
               (cl-letf (((symbol-function 'magit-refresh)
                          (lambda (&rest _) (cl-incf refreshes))))
                 (magit-difftastic--stage-chunk-1 chunk))
