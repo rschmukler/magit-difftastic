@@ -1934,19 +1934,24 @@ preserved.  Single-column chunks (no right column) are returned unchanged."
         (let ((beg (point-min)) (end (point-max)))
           (if (not (eq (magit-difftastic--chunk-layout beg end) 'side-by-side))
               body-lines
-            ;; Pad rows back-to-front so an earlier row's parsed positions stay
-            ;; valid after a later row is widened.
-            (dolist (row (reverse (magit-difftastic--parse-chunk-bounds beg end)))
-              (pcase-let ((`((,bol ,_eol) ,_left ,right) row))
-                (when (and right (cadr right))
-                  (let* ((rbeg (cadr right))
-                         (cur (string-width
-                               (buffer-substring-no-properties bol rbeg)))
-                         (pad (- target cur)))
-                    (when (> pad 0)
-                      (save-excursion
-                        (goto-char rbeg)
-                        (insert (make-string pad ?\s))))))))
+            ;; difft right-aligns the right numbers, so each row's number
+            ;; starts at a different column when their widths differ (99 vs
+            ;; 100).  Every row gets the same padding to keep that alignment.
+            (let* ((rows (cl-remove-if-not
+                          (pcase-lambda (`(,_ ,_ ,right)) (cadr right))
+                          (magit-difftastic--parse-chunk-bounds beg end)))
+                   (cur (cl-loop for row in rows
+                                 maximize (string-width
+                                           (buffer-substring-no-properties
+                                            (caar row) (cadr (nth 2 row))))))
+                   (pad (and rows (- target cur))))
+              (when (and pad (> pad 0))
+                ;; Pad back-to-front so an earlier row's parsed positions stay
+                ;; valid after a later row is widened.
+                (dolist (row (reverse rows))
+                  (save-excursion
+                    (goto-char (cadr (nth 2 row)))
+                    (insert (make-string pad ?\s))))))
             ;; Extract the (now padded) body lines back out, properties intact.
             (let (out)
               (goto-char body-start)

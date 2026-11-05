@@ -1027,6 +1027,48 @@ still reads the same line numbers and `git apply' stages the right git hunks."
             (should (string-match-p "^\\+delta-modified$" staged))
             (should (string-match-p "^\\+golf-added$" staged))))))))
 
+(ert-deftest magit-difftastic-integration/align-columns-keeps-numbers-right-aligned ()
+  "Aligning a chunk whose right line numbers differ in width keeps the code in line.
+difft right-aligns the right numbers (` 99' over `100'); every row is padded by
+the same amount so the code after them still starts at one column."
+  (skip-unless dst-test--have-tools)
+  (skip-unless (fboundp 'difftastic--classify-chunk))
+  (let ((old (mapconcat (lambda (i) (format "line %d\n" i))
+                        (number-sequence 1 95) ""))
+        (new (concat (mapconcat (lambda (i) (format "line %d\n" i))
+                                (number-sequence 1 89) "")
+                     "line 90 changed\n"
+                     (mapconcat (lambda (i) (format "added %d\n" i))
+                                (number-sequence 1 12) "")
+                     (mapconcat (lambda (i) (format "line %d\n" i))
+                                (number-sequence 91 95) ""))))
+    (dst-test--with-repo `(("sample.txt" . ,old)) `(("sample.txt" . ,new))
+      (let* ((magit-difftastic-display "side-by-side-show-both")
+             (magit-difftastic-width 160)
+             (body (car (last (magit-difftastic--split-chunk-bodies
+                               (magit-difftastic--file-diff-string
+                                "sample.txt" magit-difftastic--diff-base)))))
+             (col (magit-difftastic--chunk-right-col body))
+             (code-cols
+              (lambda (lines)
+                (delete-dups
+                 (delq nil
+                       (mapcar (lambda (l)
+                                 ;; The right side's code ends the row.
+                                 (when (string-match
+                                        " [0-9]+ \\(\\(?:line\\|added\\) [0-9]+[a-z ]*\\)\\'"
+                                        l)
+                                   (match-beginning 1)))
+                               lines))))))
+        (should col)
+        ;; The chunk spans two- and three-digit right numbers.
+        (should (cl-some (lambda (l) (string-match-p " 99 added" l)) body))
+        (should (cl-some (lambda (l) (string-match-p " 100 added" l)) body))
+        (should (= 1 (length (funcall code-cols body))))
+        (let ((padded (magit-difftastic--align-chunk-lines body (+ col 5))))
+          (should (equal (funcall code-cols padded)
+                         (list (+ 5 (car (funcall code-cols body)))))))))))
+
 (ert-deftest magit-difftastic-integration/align-columns-inline-noop ()
   "Alignment is a no-op for the inline (single-column) layout.
 `--two-column-display-p' is nil for inline, `--chunk-right-col' yields nil, and
